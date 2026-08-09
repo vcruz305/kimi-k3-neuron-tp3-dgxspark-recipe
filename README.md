@@ -30,20 +30,17 @@ Binary: `kimi_k3_dist_generate` (multi-prompt + KV reset `-2`).
 
 ### 4× Spark — TP4 `ExpertFfn2D` eg=2/fs=2 (FFN 768/768 · ~84 GiB/rank)
 
-Multi-prompt · n-predict=128 · 6 prompts · **drop prompt0** for median:
+Multi-prompt · n-predict=128 · 6 prompts · **drop prompt0** for median. Full tables:
+[`docs/TP4-SPEED-RESULTS.md`](docs/TP4-SPEED-RESULTS.md).
 
-| Metric | Value |
-|--------|------:|
-| prompt0 (cold) | 6.71 |
-| prompt1 | 7.98 |
-| prompt2 | 7.90 |
-| prompt3 | 7.40 |
-| prompt4 (peak) | **8.02** |
-| prompt5 | 7.59 |
-| **Median (drop p0)** | **7.90** |
-| Mean (all 6) | **7.60** |
-| vs RPC 2.85 | **~2.77×** |
-| vs TP3 best 6.21 | **~1.27×** |
+| Config | Median (ex p0) | Mean (all) | Peak | notes |
+|--------|---------------:|-----------:|-----:|-------|
+| Eager seal | **7.90** | 7.60 | 8.02 | first clean 4-rank |
+| GRAPH=1 | 7.84 | 7.85 | 7.89 | **no win** — keep GRAPH=0 |
+| **+ stream syncfix** | **7.945** | **7.894** | **8.040** | worker no per-token sync; async `d_pos` / logits D2H |
+
+Syncfix per-prompt (best so far): p0 7.90 · p1 **8.04** · p2 7.70 · p3 8.03 · p4 7.75 · p5 7.95  
+**p95_ex0 ≈ 8.04** · vs RPC 2.85 **~2.79×** · vs TP3 6.21 **~1.28×** · delta vs 7.90 seal **+0.045 t/s**.
 
 **Finish:** OK finished clean on all four ranks (78f1 / 9f73 / 366f / b610).
 
@@ -68,7 +65,7 @@ Blind NCCL tuning and GDR enablement are **not** next levers on Spark. Prefer **
 | Forecast likely (TP3) | 4.5–6.0 |
 | Forecast stretch | 6.5–7.5 |
 | TP3 measured | **6.21** |
-| TP4 measured median | **7.90** (above prior stretch) |
+| TP4 measured median | **7.945** best (seal 7.90; above prior stretch) |
 
 Honest: single-stream exact TP still has a hard ceiling. **~10+ t/s** needs more than flag polish
 (batching, different engine path, graphs with verified parity, fabric wins). See
@@ -197,6 +194,7 @@ Report **median tok/s dropping prompt0** (cold window after load).
 | [`APPLY.md`](APPLY.md) | Patch apply order |
 | [`docs/OPERATOR-3-AND-4-SPARK.md`](docs/OPERATOR-3-AND-4-SPARK.md) | 3- and 4-Spark geometry |
 | [`docs/SPARK-TP3-PERFORMANCE-FORECAST.md`](docs/SPARK-TP3-PERFORMANCE-FORECAST.md) | tok/s bands / ceilings |
+| [`docs/TP4-SPEED-RESULTS.md`](docs/TP4-SPEED-RESULTS.md) | TP4 profile, NCCL, GRAPH A/B, syncfix median **7.945** |
 | [`docs/TP3-EXPLAINED-AND-FIXED.md`](docs/TP3-EXPLAINED-AND-FIXED.md) | TP3 design |
 
 ---
