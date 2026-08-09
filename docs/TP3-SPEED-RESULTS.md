@@ -59,3 +59,18 @@
 3. Kernels / overlap / engine only if profile still compute-bound  
 
 GDR / NCCL flag spam: **closed** on Spark GB10.
+
+---
+
+## Decode-step profile (2026-08-09)
+
+See [`TP3-DECODE-PROFILE.md`](TP3-DECODE-PROFILE.md).
+
+| Group | % (n=10) |
+|--------|---------:|
+| attn compute | **36.5** |
+| MoE ffn_partial | **23.5** |
+| Collectives (attn_ar + moe_ar) | **~26** |
+| ffn_finish + head | ~14 |
+
+**Next:** attn / MoE kernels (or vLLM engine path). Not GDR/NCCL spam.
