@@ -205,6 +205,12 @@ Report **median tok/s dropping prompt0** (cold window after load).
 
 ---
 
+
+## Related: vLLM path (next engine test on Sparks)
+
+Separate recipe: [`vcruz305/kimi-k3-neuron-tp3-vllm-recipe`](https://github.com/vcruz305/kimi-k3-neuron-tp3-vllm-recipe) — qualified on **3×H200** (~34 t/s graph target-only).  
+On **DGX Spark** this is **not** drop-in (1 GPU/node): needs multi-node TP or build smoke first. Staging notes live with the operator workspace (`SPARK-VLLM-NEXT.md`).
+
 ## Non-claims
 
 - Not a multi-user OpenAI-compatible server  
