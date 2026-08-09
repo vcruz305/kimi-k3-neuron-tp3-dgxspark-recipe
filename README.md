@@ -22,11 +22,17 @@ Binary: `kimi_k3_dist_generate` (multi-prompt + KV reset `-2`).
 
 ### 3× Spark — TP3 `AllExpertsFfnWidth` (FFN 512/512/512 · ~113 GiB/rank)
 
-| Run | decode tok/s | tokens | vs RPC 2.85 |
-|-----|-------------:|-------:|------------:|
-| Clean e2e | **5.67** | 32 | **1.99×** |
-| Longer window | **6.21** | 128 | **2.18×** |
+Full write-up: [`docs/TP3-SPEED-RESULTS.md`](docs/TP3-SPEED-RESULTS.md).
+
+| Run | decode tok/s | notes | vs RPC 2.85 |
+|-----|-------------:|-------|------------:|
+| Clean e2e | **5.67** | n=32 | **1.99×** |
+| Longer single window | **6.21** | n=128 single-shot | **2.18×** |
+| **Multi-prompt + syncfix median** | **6.84** | drop p0 · p95 **7.08** · mean **6.85** | **2.40×** |
 | llama.cpp RPC layer-split (baseline) | **2.85** | — | 1.0× |
+
+Syncfix multi-prompt (n=128, 6 prompts): p0 6.74 · p1 **7.08** · p2 6.75 · p3 6.92 · p4 6.79 · p5 6.84  
+Delta vs 6.21: **+0.63 t/s (~+10%)**. Finish clean · `moe_ffn_local=512`.
 
 ### 4× Spark — TP4 `ExpertFfn2D` eg=2/fs=2 (FFN 768/768 · ~84 GiB/rank)
 
@@ -64,7 +70,7 @@ Blind NCCL tuning and GDR enablement are **not** next levers on Spark. Prefer **
 |------|------:|
 | Forecast likely (TP3) | 4.5–6.0 |
 | Forecast stretch | 6.5–7.5 |
-| TP3 measured | **6.21** |
+| TP3 measured median | **6.84** (single-shot was 6.21) |
 | TP4 measured median | **7.945** best (seal 7.90; above prior stretch) |
 
 Honest: single-stream exact TP still has a hard ceiling. **~10+ t/s** needs more than flag polish
