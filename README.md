@@ -203,6 +203,8 @@ Report **median tok/s dropping prompt0** (cold window after load).
 | [`APPLY.md`](APPLY.md) | Patch apply order |
 | [`docs/OPERATOR-3-AND-4-SPARK.md`](docs/OPERATOR-3-AND-4-SPARK.md) | 3- and 4-Spark geometry |
 | [`docs/SPARK-TP3-PERFORMANCE-FORECAST.md`](docs/SPARK-TP3-PERFORMANCE-FORECAST.md) | tok/s bands / ceilings |
+| [`docs/TP3-SPEED-RESULTS.md`](docs/TP3-SPEED-RESULTS.md) | TP3 multi-prompt + syncfix median **6.84** |
+| [`docs/TP3-DECODE-PROFILE.md`](docs/TP3-DECODE-PROFILE.md) | TP3 profile: attn **36.5%** · MoE **23.5%** · coll **~26%** |
 | [`docs/TP4-SPEED-RESULTS.md`](docs/TP4-SPEED-RESULTS.md) | TP4 profile, NCCL, GRAPH A/B, syncfix median **7.945** |
 | [`docs/TP3-EXPLAINED-AND-FIXED.md`](docs/TP3-EXPLAINED-AND-FIXED.md) | TP3 design |
 
