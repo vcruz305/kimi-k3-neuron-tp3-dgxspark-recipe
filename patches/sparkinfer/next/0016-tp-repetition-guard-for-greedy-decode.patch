@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000f Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 07:40:00 -0700
+Subject: [PATCH] tp: 0016 repetition guard for greedy decode
+
+Confirmed live on the real 3-Spark fleet: pure greedy argmax with zero
+repetition guard collapses into an infinite single-token loop for a real
+chat-templated prompt (token 53408, "atos", repeated for the whole
+completion) and for a minimal raw single-token smoke prompt (token 220, a
+plain space, repeated) -- reproduced on both the new API-server serve mode
+and the pre-existing --prompts-file static path. Not a regression from
+either 0014 or the uncommitted multi-prompt/KV-reset work: the token-
+selection call itself, kimi_k3_dist_argmax(logits, vocab), is untouched by
+both. This recipe's documented benchmarks only ever check decode_tok_s /
+"OK finished clean", never decoded content, so nothing before now would
+have caught this -- it looks like a pre-existing characteristic of greedy
+decoding on this IQ1_S (~1.56 bit/weight) quantization, not new breakage.
+
+Adds a minimal, deterministic repetition guard applied to rank0's logits
+buffer immediately before each argmax call, in both the static and serve
+decode loops (they are two separate call sites in this file, so both need
+the fix): any token that has already appeared N times within the last W
+generated tokens gets hard-banned (-inf) before argmax runs. Magnitude-
+agnostic by construction -- it acts on token identity/count, not logit
+scale, so it needs no tuning against this quantization's dynamic range.
+Two passes: window=1/max=1 (absolute no-immediate-repeat) plus
+window=64/max=4 (caps short A,B,A,B,... cycles too).
+
+Deliberately no RNG, no sampler, no temperature/top-p: this changes nothing
+about the existing rank0-selects-then-broadcasts-to-workers pattern, only
+which token rank0's own argmax is allowed to pick, so worker-side
+determinism and the inter-rank protocol are untouched. Real
+temperature/top-p sampling (which would need a seeded RNG on rank0,
+broadcast the same way the argmax choice already is) is left as later work
+if the simpler guard here turns out not to be enough in practice.
+---
+ runtime/examples/kimi_k3_dist_generate.cpp | 37 ++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+index 452fbfc..c78d96e 100644
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -18,16 +18,19 @@
+ #include "sparkinfer/tp/rank_protocol.h"
+ #include "sparkinfer/tp/rank_transport.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <fstream>
++#include <limits>
+ #include <set>
+ #include <sstream>
+ #include <string>
+ #include <thread>
++#include <unordered_map>
+ #include <vector>
+ #include <cuda_runtime.h>
+ 
+@@ -317,6 +320,38 @@ void fill_digests(RankSpec* spec) {
+     if (!spec->plan_digest[0]) spec->plan_digest[0] = 0x5A;
+ }
+ 
++// Pure greedy argmax with zero repetition guard can collapse into an infinite
++// single-token (or short-cycle) loop -- observed on this IQ1_S quantization:
++// a full completion of nothing but one repeated token. Hard-bans (-inf) any
++// token that has already appeared `max_occurrences` times within the last
++// `window` generated tokens, in place on the logits buffer, immediately
++// before argmax runs. Magnitude-agnostic by construction (acts on token
++// identity/count, not logit scale, so it needs no tuning against whatever
++// dynamic range this quantization's logits happen to have) and fully
++// deterministic (no RNG), so it changes nothing about the existing
++// rank0-selects-then-broadcasts-to-workers pattern -- only which token
++// rank0's argmax is allowed to pick.
++void apply_repetition_guard(float* logits, int vocab, const std::vector<int>& history,
++                            int window, int max_occurrences) {
++    if (window <= 0 || max_occurrences <= 0) return;
++    std::unordered_map<int, int> counts;
++    const int n = (int)history.size();
++    for (int i = std::max(0, n - window); i < n; ++i) {
++        const int tok = history[i];
++        if (tok < 0 || tok >= vocab) continue;
++        if (++counts[tok] >= max_occurrences) {
++            logits[tok] = -std::numeric_limits<float>::infinity();
++        }
++    }
++}
++
++// Two passes: an absolute "no immediate repeat" ban on the single last token,
++// plus a wider cap so short cycles (A,B,A,B,...) can't run forever either.
++void apply_decode_guard(float* logits, int vocab, const std::vector<int>& generated) {
++    apply_repetition_guard(logits, vocab, generated, /*window=*/1, /*max_occurrences=*/1);
++    apply_repetition_guard(logits, vocab, generated, /*window=*/64, /*max_occurrences=*/4);
++}
++
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -625,6 +660,7 @@ int main(int argc, char** argv) {
+                 bool client_gone = false;
+                 const auto t_gen0 = clock::now();
+                 for (int n = 0; n < req.n_predict; ++n) {
++                    apply_decode_guard(logits.data(), dist.cfg.vocab, generated);
+                     const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
+                     if (req.stop_ids.count(next)) {
+                         stop_reason = "stop";
+@@ -727,6 +763,7 @@ int main(int argc, char** argv) {
+             std::vector<int> generated;
+             const auto t_gen0 = clock::now();
+             for (int n = 0; n < n_predict; ++n) {
++                apply_decode_guard(logits.data(), dist.cfg.vocab, generated);
+                 const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
+                 generated.push_back(next);
+                 std::printf(" gen[%d]=%d\n", n, next);
+-- 
+2.52.0.windows.1
+

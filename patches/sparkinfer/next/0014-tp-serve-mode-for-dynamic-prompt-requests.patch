@@ -1,0 +1,483 @@
+From 0000000000000000000000000000000000000d Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 00:13:27 -0700
+Subject: [PATCH] tp: 0014 rank0 serve mode for dynamic prompt requests
+
+kimi_k3_dist_generate currently only accepts a fixed, pre-known list of
+prompts (--prompt-ids or --prompts-file) and exits once it has processed
+them. That is fine for benchmarking but cannot back an HTTP server: an
+OpenAI-compatible API needs to accept requests arriving at arbitrary
+times without a ~6min reload each time.
+
+Adds a rank0-only --serve HOST:PORT flag. After bootstrap+load completes
+(unchanged), rank0 opens a second, local, plain-TCP control port and
+loops accepting one request at a time instead of iterating a static
+prompt list. Each request is one line of semicolon-separated key=value
+fields (prompt_ids=1,2,3;n_predict=128;stop_ids=17,42;stream=1). With
+stream=1 the response is one "tok=<id>" line per sampled token followed
+by a single terminating line (ok=1;generated_ids=...;prefill_s=..;
+decode_s=..;stop_reason=..); without it, only the terminating line is
+sent. A dead client mid-stream does not abort decode -- the engine
+keeps running to completion so rank state stays synchronized for the
+next request, it just stops writing to a socket nobody reads any more.
+A shutdown=1 request cleanly calls the existing ctr.finish() and exits.
+
+Reuses the exact same one_step()/KV-reset machinery already used by
+--prompts-file multi-prompt mode -- only the source of prompts changes
+(a socket loop instead of a static file read once at startup). The
+existing --prompts-file/--prompt-ids static path is untouched (still
+used for the TP3/TP4 benchmarking this recipe reports numbers from);
+serve mode is an additional branch taken only when --serve is given.
+
+Not the rank_protocol::Message wire format: that framing exists to
+carry cluster-identity fields for inter-rank NCCL bootstrap, not a
+request from a local client process. This is a separate, minimal,
+line-based protocol with a single caller (the API wrapper) talking to
+a strictly sequential engine (one KV cache, no batching) -- one
+connection at a time is all there is to gain from.
+
+No behavior change to the existing static multi-prompt/single-prompt
+path when --serve is not passed.
+---
+ runtime/examples/kimi_k3_dist_generate.cpp | 367 +++++++++++++++++++++++++++--
+ 1 file changed, 346 insertions(+), 21 deletions(-)
+
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+index f8604af..452fbfc 100644
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -24,12 +24,18 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <fstream>
++#include <set>
+ #include <sstream>
+ #include <string>
+ #include <thread>
+ #include <vector>
+ #include <cuda_runtime.h>
+ 
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
+ using namespace sparkinfer;
+ using namespace sparkinfer::tp::dist;
+ 
+@@ -48,10 +54,21 @@ void usage(const char* argv0) {
+                  "usage: %s --rank R --world 3|4 (--listen HOST:PORT | --coord HOST:PORT)\n"
+                  "          --model FIRST.gguf [--prompt-ids 1,2,3] [--prompt-ids-file F]\n"
+                  "          [--prompts-file F]   # multi-prompt: one CSV id-line per prompt; load once\n"
++                 "          [--serve HOST:PORT]  # rank0-only: serve dynamic requests after load\n"
+                  "          [--n-predict N] [--max-ctx N] [--device 0]\n"
+                  "          [--session-id N] [--dry-protocol]\n"
+                  "\n"
+-                 "  KV reset sentinel token id = -2 (broadcast between multi-prompts).\n",
++                 "  KV reset sentinel token id = -2 (broadcast between multi-prompts).\n"
++                 "\n"
++                 "  --serve keeps rank0 resident after load and accepts requests on a local\n"
++                 "  control port instead of reading --prompts-file. One line per request,\n"
++                 "  semicolon-separated key=value fields:\n"
++                 "    prompt_ids=1,2,3;n_predict=128;stop_ids=17,42;stream=1\n"
++                 "  Response: with stream=1, one 'tok=<id>' line per sampled token, then a\n"
++                 "  single terminating line ok=1;generated_ids=...;prefill_s=..;decode_s=..;\n"
++                 "  stop_reason=.. (generated_ids echoes the full sequence even when streamed).\n"
++                 "  Without stream=1, only the terminating line is sent. Errors: ok=0;error=...\n"
++                 "  Send shutdown=1 to end the process cleanly.\n",
+                  argv0);
+ }
+ 
+@@ -106,6 +123,189 @@ std::vector<std::vector<int>> load_prompts_file(const std::string& path) {
+ // Special token: rank0 broadcasts this between multi-prompts; all ranks reset KV.
+ constexpr int kKvResetSentinel = -2;
+ 
++// ---- Serve mode: a small local control port for dynamic requests ----------
++//
++// Deliberately not the rank_protocol::Message wire format (that framing carries
++// cluster-identity fields meant for inter-rank NCCL bootstrap, not a request from
++// a local client process). One connection at a time, one line in, one line out --
++// this only ever has a single caller (the API wrapper) and the engine itself is
++// strictly sequential (one KV cache, no batching), so nothing is gained by more.
++
++struct ServeRequest {
++    std::vector<int> prompt_ids;
++    int n_predict = 128;
++    std::set<int> stop_ids;
++    bool stream = false;
++    bool shutdown = false;
++};
++
++bool parse_serve_request(const std::string& line, ServeRequest* req, std::string* error) {
++    std::stringstream ss(line);
++    std::string field;
++    while (std::getline(ss, field, ';')) {
++        if (field.empty()) continue;
++        const auto eq = field.find('=');
++        if (eq == std::string::npos) {
++            if (error) *error = "malformed field (no '='): " + field;
++            return false;
++        }
++        const std::string key = field.substr(0, eq);
++        const std::string val = field.substr(eq + 1);
++        if (key == "prompt_ids") {
++            req->prompt_ids = parse_ids_csv(val);
++        } else if (key == "n_predict") {
++            req->n_predict = std::atoi(val.c_str());
++        } else if (key == "stop_ids") {
++            for (int id : parse_ids_csv(val)) req->stop_ids.insert(id);
++        } else if (key == "stream") {
++            req->stream = (val == "1");
++        } else if (key == "shutdown") {
++            req->shutdown = (val == "1");
++        }
++        // unknown keys ignored for forward-compat.
++    }
++    if (!req->shutdown && req->n_predict < 0) {
++        if (error) *error = "n_predict must be >= 0";
++        return false;
++    }
++    return true;
++}
++
++std::string format_serve_ok(const std::vector<int>& generated, double prefill_s,
++                            double decode_s, const std::string& stop_reason) {
++    std::ostringstream os;
++    os << "ok=1;generated_ids=";
++    for (size_t i = 0; i < generated.size(); ++i) os << (i ? "," : "") << generated[i];
++    os << ";prefill_s=" << prefill_s << ";decode_s=" << decode_s
++       << ";stop_reason=" << stop_reason;
++    return os.str();
++}
++
++std::string format_serve_err(const std::string& detail) {
++    std::string safe = detail;
++    for (char& c : safe) {
++        if (c == '\n' || c == '\r' || c == ';') c = ' ';
++    }
++    return "ok=0;error=" + safe;
++}
++
++// One accepted client connection on the serve control port.
++class ServeConn {
++public:
++    ServeConn() = default;
++    explicit ServeConn(int fd) : fd_(fd) {}
++    ~ServeConn() { close(); }
++    ServeConn(ServeConn&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
++    ServeConn& operator=(ServeConn&& other) noexcept {
++        if (this != &other) {
++            close();
++            fd_ = other.fd_;
++            other.fd_ = -1;
++        }
++        return *this;
++    }
++    ServeConn(const ServeConn&) = delete;
++    ServeConn& operator=(const ServeConn&) = delete;
++
++    void close() {
++        if (fd_ >= 0) ::close(fd_);
++        fd_ = -1;
++    }
++
++    // Reads one '\n'-terminated line (bare LF or CRLF). Returns false only if no
++    // data was read at all before the peer closed (empty request).
++    bool read_line(std::string* out) {
++        out->clear();
++        char c;
++        for (;;) {
++            const ssize_t r = ::recv(fd_, &c, 1, 0);
++            if (r <= 0) return !out->empty();
++            if (c == '\n') return true;
++            if (c != '\r') out->push_back(c);
++            if (out->size() > (1u << 20)) return false;  // guard: no unbounded lines
++        }
++    }
++
++    bool write_line(const std::string& s) {
++        const std::string line = s + "\n";
++        std::size_t off = 0;
++        while (off < line.size()) {
++            const ssize_t w = ::send(fd_, line.data() + off, line.size() - off, 0);
++            if (w <= 0) return false;
++            off += static_cast<std::size_t>(w);
++        }
++        return true;
++    }
++
++private:
++    int fd_ = -1;
++};
++
++// Listen socket for the serve control port. IPv4 only, matches the rest of this
++// milestone's transport (see rank_transport_tcp.cpp TcpListener).
++class ServeListener {
++public:
++    ~ServeListener() { close(); }
++
++    bool listen(const std::string& host, uint16_t port, std::string* error) {
++        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
++        if (fd_ < 0) {
++            if (error) *error = "socket() failed";
++            return false;
++        }
++        int one = 1;
++        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++        sockaddr_in addr{};
++        addr.sin_family = AF_INET;
++        addr.sin_port = htons(port);
++        if (host.empty() || host == "0.0.0.0") {
++            addr.sin_addr.s_addr = htonl(INADDR_ANY);
++        } else if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
++            if (error) *error = "invalid --serve host (IPv4 only)";
++            close();
++            return false;
++        }
++        if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
++            if (error) *error = "bind() failed";
++            close();
++            return false;
++        }
++        if (::listen(fd_, 8) != 0) {
++            if (error) *error = "listen() failed";
++            close();
++            return false;
++        }
++        sockaddr_in bound{};
++        socklen_t blen = sizeof(bound);
++        if (getsockname(fd_, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
++            port_ = ntohs(bound.sin_port);
++        }
++        return true;
++    }
++
++    uint16_t port() const { return port_; }
++
++    bool accept(ServeConn* out, std::string* error) {
++        sockaddr_in peer{};
++        socklen_t plen = sizeof(peer);
++        const int cfd = ::accept(fd_, reinterpret_cast<sockaddr*>(&peer), &plen);
++        if (cfd < 0) {
++            if (error) *error = "accept() failed";
++            return false;
++        }
++        *out = ServeConn(cfd);
++        return true;
++    }
++
++private:
++    void close() {
++        if (fd_ >= 0) ::close(fd_);
++        fd_ = -1;
++    }
++    int fd_ = -1;
++    uint16_t port_ = 0;
++};
++
+ void fill_digests(RankSpec* spec) {
+     const std::string mid = "Kimi-K3-Neuron-IQ1S-GGUF";
+     const std::string pid = plan_identity_string(spec->world_size);
+@@ -122,7 +322,7 @@ void fill_digests(RankSpec* spec) {
+ int main(int argc, char** argv) {
+     int rank = -1, world = 3, device = 0, n_predict = 8, max_ctx = 8192;
+     std::uint64_t session_id = 1;
+-    std::string model, listen, coord, prompt_csv, prompt_file, prompts_file;
++    std::string model, listen, coord, prompt_csv, prompt_file, prompts_file, serve_addr;
+     bool dry_protocol = false;
+ 
+     for (int i = 1; i < argc; ++i) {
+@@ -144,6 +344,7 @@ int main(int argc, char** argv) {
+             prompt_file = need("--prompt-ids-file");
+         else if (!std::strcmp(argv[i], "--prompts-file"))
+             prompts_file = need("--prompts-file");
++        else if (!std::strcmp(argv[i], "--serve")) serve_addr = need("--serve");
+         else if (!std::strcmp(argv[i], "--n-predict")) n_predict = std::atoi(need("--n-predict"));
+         else if (!std::strcmp(argv[i], "--max-ctx")) max_ctx = std::atoi(need("--max-ctx"));
+         else if (!std::strcmp(argv[i], "--session-id"))
+@@ -175,6 +376,18 @@ int main(int argc, char** argv) {
+         std::fprintf(stderr, "workers require --coord HOST:PORT\n");
+         return 2;
+     }
++    std::string serve_host;
++    uint16_t serve_port = 0;
++    if (!serve_addr.empty()) {
++        if (rank != 0) {
++            std::fprintf(stderr, "--serve is rank0-only\n");
++            return 2;
++        }
++        if (!parse_host_port(serve_addr, &serve_host, &serve_port)) {
++            std::fprintf(stderr, "bad --serve %s\n", serve_addr.c_str());
++            return 2;
++        }
++    }
+ 
+     RankSpec spec;
+     spec.session_id = session_id ? session_id : 1;
+@@ -287,25 +500,6 @@ int main(int argc, char** argv) {
+         }
+         gen_trace("rank0 bootstrap+load complete; starting prompt loop");
+ 
+-        // Build prompt list: multi-prompt file OR single prompt.
+-        std::vector<std::vector<int>> prompts;
+-        if (!prompts_file.empty()) {
+-            prompts = load_prompts_file(prompts_file);
+-        } else {
+-            std::vector<int> prompt;
+-            if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
+-            else if (!prompt_csv.empty()) prompt = parse_ids_csv(prompt_csv);
+-            else prompt = {1};
+-            if (!prompt.empty()) prompts.push_back(std::move(prompt));
+-        }
+-        if (prompts.empty()) {
+-            std::fprintf(stderr, "empty prompt ids\n");
+-            return 2;
+-        }
+-        std::printf("[rank0] prompts=%zu n_predict=%d max_ctx=%d (multi-prompt keeps weights loaded)\n",
+-                    prompts.size(), n_predict, max_ctx);
+-        std::fflush(stdout);
+-
+         std::vector<float> logits((size_t)dist.cfg.vocab);
+ 
+         auto one_step = [&](int tok, float* logits_out) -> bool {
+@@ -364,6 +558,137 @@ int main(int argc, char** argv) {
+             return true;
+         };
+ 
++        // Serve mode: accept dynamic requests on a local control port instead of a
++        // fixed --prompts-file list, after the model is already resident. Reuses
++        // the exact same one_step()/KV-reset machinery as multi-prompt mode above --
++        // only the source of prompts changes (a socket loop instead of a static file).
++        if (!serve_addr.empty()) {
++            gen_trace("rank0 entering serve mode");
++            ServeListener slistener;
++            if (!slistener.listen(serve_host, serve_port, &err)) {
++                std::fprintf(stderr, "serve listen failed: %s\n", err.c_str());
++                return 1;
++            }
++            std::printf("[rank0] serve mode listening on %s:%u (world=%d, max_ctx=%d)\n",
++                        serve_host.c_str(), (unsigned)slistener.port(), world, max_ctx);
++            std::fflush(stdout);
++
++            using clock = std::chrono::steady_clock;
++            bool served_any = false;
++            for (;;) {
++                ServeConn conn;
++                std::string accept_err;
++                if (!slistener.accept(&conn, &accept_err)) {
++                    std::fprintf(stderr, "[rank0] serve accept failed: %s\n", accept_err.c_str());
++                    continue;
++                }
++                std::string line;
++                if (!conn.read_line(&line)) continue;  // client disconnected, no request
++
++                ServeRequest req;
++                std::string perr;
++                if (!parse_serve_request(line, &req, &perr)) {
++                    conn.write_line(format_serve_err(perr));
++                    continue;
++                }
++                if (req.shutdown) {
++                    conn.write_line("ok=1;shutdown=1");
++                    break;
++                }
++                if (req.prompt_ids.empty()) {
++                    conn.write_line(format_serve_err("empty prompt_ids"));
++                    continue;
++                }
++
++                if (served_any) {
++                    if (!one_step(kKvResetSentinel, nullptr)) {
++                        conn.write_line(format_serve_err("kv reset failed"));
++                        return 1;
++                    }
++                }
++                served_any = true;
++
++                bool step_ok = true;
++                const auto t_prefill0 = clock::now();
++                for (size_t i = 0; i < req.prompt_ids.size() && step_ok; ++i) {
++                    float* lp = (i + 1 == req.prompt_ids.size()) ? logits.data() : nullptr;
++                    step_ok = one_step(req.prompt_ids[i], lp);
++                }
++                if (!step_ok) {
++                    conn.write_line(format_serve_err("prefill failed"));
++                    return 1;
++                }
++                const double prefill_s = std::chrono::duration<double>(clock::now() - t_prefill0).count();
++
++                std::vector<int> generated;
++                std::string stop_reason = "length";
++                bool client_gone = false;
++                const auto t_gen0 = clock::now();
++                for (int n = 0; n < req.n_predict; ++n) {
++                    const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
++                    if (req.stop_ids.count(next)) {
++                        stop_reason = "stop";
++                        break;
++                    }
++                    generated.push_back(next);
++                    // Streaming: push each token id as it is sampled, so the API
++                    // wrapper can forward it before the whole reply is done. "tok="
++                    // progress lines precede the single terminating "ok=..."/
++                    // "ok=0;..." line. A dead client (write failure) does not abort
++                    // decode -- the engine keeps running to completion so rank state
++                    // stays synchronized for the next request; we just stop trying
++                    // to write to a socket nobody is reading from any more.
++                    if (req.stream && !client_gone) {
++                        client_gone = !conn.write_line("tok=" + std::to_string(next));
++                    }
++                    if (!one_step(next, logits.data())) {
++                        if (!client_gone) conn.write_line(format_serve_err("decode failed"));
++                        return 1;
++                    }
++                }
++                const double decode_s = std::chrono::duration<double>(clock::now() - t_gen0).count();
++                std::fprintf(stderr,
++                             "[k3-dist][serve] prompt_tokens=%zu generated_tokens=%zu "
++                             "prefill_s=%.6f decode_s=%.6f stop_reason=%s\n",
++                             req.prompt_ids.size(), generated.size(), prefill_s, decode_s,
++                             stop_reason.c_str());
++                std::fflush(stderr);
++
++                conn.write_line(format_serve_ok(generated, prefill_s, decode_s, stop_reason));
++            }
++
++            gen_trace("rank0 serve mode finish enter");
++            if (!ctr.finish(&err)) {
++                std::fprintf(stderr, "finish: %s\n", err.c_str());
++                std::fflush(stderr);
++                return 1;
++            }
++            gen_trace("rank0 serve mode finish ok");
++            std::printf("OK finished clean (serve mode)\n");
++            std::fflush(stdout);
++            kimi_k3_dist_rank_free(&dist);
++            return 0;
++        }
++
++        // Build prompt list: multi-prompt file OR single prompt.
++        std::vector<std::vector<int>> prompts;
++        if (!prompts_file.empty()) {
++            prompts = load_prompts_file(prompts_file);
++        } else {
++            std::vector<int> prompt;
++            if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
++            else if (!prompt_csv.empty()) prompt = parse_ids_csv(prompt_csv);
++            else prompt = {1};
++            if (!prompt.empty()) prompts.push_back(std::move(prompt));
++        }
++        if (prompts.empty()) {
++            std::fprintf(stderr, "empty prompt ids\n");
++            return 2;
++        }
++        std::printf("[rank0] prompts=%zu n_predict=%d max_ctx=%d (multi-prompt keeps weights loaded)\n",
++                    prompts.size(), n_predict, max_ctx);
++        std::fflush(stdout);
++
+         using clock = std::chrono::steady_clock;
+         double sum_decode_tps = 0.0;
+         int n_ok = 0;
+-- 
+2.52.0.windows.1
+

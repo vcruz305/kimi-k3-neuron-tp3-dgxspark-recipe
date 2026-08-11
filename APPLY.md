@@ -24,7 +24,9 @@ for p in \
   /tmp/k3-recipe/patches/sparkinfer/next/0010-tp-first-forward-stall-instrumentation.patch \
   /tmp/k3-recipe/patches/sparkinfer/next/0011-tp-finish-deadlock-and-decode-tps.patch \
   /tmp/k3-recipe/patches/sparkinfer/next/0012-tp-finish-ack-after-wait-token.patch \
-  /tmp/k3-recipe/patches/sparkinfer/next/0013-tp-pin-per-tensor-host-memory-for-fast-load.patch
+  /tmp/k3-recipe/patches/sparkinfer/next/0013-tp-pin-per-tensor-host-memory-for-fast-load.patch \
+  /tmp/k3-recipe/patches/sparkinfer/next/0014-tp-serve-mode-for-dynamic-prompt-requests.patch \
+  /tmp/k3-recipe/patches/sparkinfer/next/0016-tp-repetition-guard-for-greedy-decode.patch
 do git am "$p"; done
 
 cmake -S runtime -B build -DSPARKINFER_TP=ON
@@ -43,6 +45,9 @@ cmake --build build -j"$(nproc)" --target kimi_k3_dist_generate \
 | 0011 | finish deadlock fix + decode tok/s lines |
 | 0012 | FinishAck after wait_token (teardown hang) |
 | **0013** | **pin per-tensor host memory — load time fix (primary path)** |
+| 0014 | rank0 `--serve HOST:PORT` mode — dynamic prompt requests for the API wrapper (see `api-server/`) |
+| 0015 | *(reserved)* multi-prompt/`--prompts-file` + KV-reset — currently only exists as an uncommitted diff on rank0; needs to land between 0013 and 0014 once captured (tracked separately) |
+| 0016 | repetition guard for greedy decode — fixes the collapse-to-one-repeated-token failure mode found while live-testing the API wrapper (see `api-server/README.md`); applies on top of 0014 |
 
 ### 0011
 - `finish()` no longer holds `mu_` while waiting (unblocks rx FinishAcks)
