@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000f Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 08:20:00 -0700
+Subject: [PATCH] test: 0017 fix three bugs in kimi_k3_state_check
+
+kimi_k3_state_check is the ONLY multi-token validation in the tree. It is
+the sole guard on the three code paths its own header calls out as
+structurally unreachable at position 0 -- the KDA conv window shift, the
+KDA delta-rule state accumulation, and MLA attention with a real softmax
+over a grown KV cache. It had never been green. Run against the real
+Neuron IQ1_S weights it reported relL2 ~1.0-1.9 on every layer and every
+token, i.e. the "structural bug" signature its sibling checks explicitly
+describe (kimi_k3_moe_ref_check: "A structural bug shows as relL2 ~ O(1)").
+
+All three failures were in the TEST, not the engine. Fixed here:
+
+1. THE DEVICE POSITION MIRROR WAS NEVER MOVED. The loop did a bare
+   `++st.position`, updating only the host mirror. d_pos stayed 0 for the
+   whole run, so every token wrote KV row 0 and attended over n_ctx == 1
+   while the float64 reference correctly grew its cache. This is precisely
+   the desync kimi_k3.cpp:806 exists to prevent -- "THE ONLY SANCTIONED WAY
+   TO MOVE THE POSITION ... any caller that writes one without the other
+   desyncs them" -- and the same mistake kimi_k3_tp_bench's --seek made.
+   Now routed through kimi_k3_set_position.
+
+2. beta WAS NOT SIGMOID'D. llama.cpp's build_kda_layer applies
+   beta = sigmoid(ssm_beta @ x) before the scan, and
+   kimi_k3_layer0_ref_check.cpp:244 does too. This reference did not, which
+   alone put it relL2 ~1.9 from the GPU at t == 0 -- a token where the
+   sibling full-layer check agrees with the same GPU to 4.6e-06.
+
+3. THE DECAY AXIS WAS THE PRE-624eb05 CONTRACT. The reference decayed
+   S[j][i] by exp(g[j]); the kernels decay by exp(g[i]). Commit 624eb05
+   ("match llama.cpp's EXECUTED KDA path") changed kda_decode_step_kernel
+   and this reference was never followed along. The kernel side is
+   self-consistent -- kda_decode_step_kernel and the independently written
+   k3_kda_chunk_prefill.cu both decay along the contraction/key index --
+   and that is the correct operator: the KDA forget gate multiplies S from
+   the right, in key space, which is the axis q and k contract over.
+   Indexing by j is diag(exp g)*S instead of S*diag(exp g); the two are
+   bit-identical at t == 0 because S is zero, which is exactly why the
+   single-token checks could never see the difference.
+
+Note the shape of (2) and (3) together: each is invisible at t == 0 or
+agrees with a stale contract, so the test failed loudly enough to look
+broken and was evidently never chased. A permanently-red test is worse
+than no test -- it guards nothing and it trains the reader to ignore it.
+
+After the fix, against the real weights with SPARKINFER_K3_GGML_QACT_PROJ=0
+(the float64 references do not model Q8_0 activation quantization, which is
+default-ON and is what makes the ref_checks look like they fail):
+
+  KDA layer 0, 8 tokens   relL2 ~3.4e-07   PASS
+  KDA layer 1, 8 tokens   relL2 ~3.1e-07   PASS
+  KDA layer 2, 8 tokens   relL2 ~3.2e-07   PASS
+  MLA layer 3, 6 tokens   relL2 ~2.0e-04   PASS
+  MLA layer 7, 6 tokens   relL2 ~2.1e-04   PASS
+
+So the KDA recurrence and the MLA KV growth are correct across tokens on a
+single GPU, and this test now actually says so.
+---
+ runtime/examples/kimi_k3_state_check.cpp | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/examples/kimi_k3_state_check.cpp b/runtime/examples/kimi_k3_state_check.cpp
+index 81e0656..e081cca 100644
+--- a/runtime/examples/kimi_k3_state_check.cpp
++++ b/runtime/examples/kimi_k3_state_check.cpp
+@@ -260,6 +260,10 @@ int main(int argc, char** argv) {
+                     dg[h*hd+d] = cfg.kda_gate_lower_bound /
+                                  (1.0 + std::exp(sa[h] * graw[h*hd+d]));
+             auto beta = matvec(Wbeta, normed, qh, H);
++            // beta is sigmoid'd before the scan (llama build_kda_layer), exactly as
++            // kimi_k3_layer0_ref_check does. Omitting it made this reference disagree
++            // with the GPU by relL2 ~ 1.9 even at t == 0.
++            for (auto& b_ : beta) b_ = 1.0 / (1.0 + std::exp(-b_));
+
+             // delta rule WITH persistent state — the recurrence proper.
+             std::vector<double> dout(qkv);
+@@ -269,11 +273,16 @@ int main(int argc, char** argv) {
+                 const double* vv = &cv[h*hd]; const double* gg = &dg[h*hd];
+                 const double b = beta[h];
+                 std::vector<double> sk(hd, 0.0);
++                // DECAY IS INDEXED BY i, THE CONTRACTION (KEY) INDEX, NOT BY j.
++                // S is [value j][key i]; the KDA forget gate multiplies S from the
++                // right in key space, so S[j][i] *= exp(g[i]). Indexing by j is
++                // diag(exp g)*S instead of S*diag(exp g) -- a different operator that
++                // is bit-identical at t == 0 (S is zero) and wrong from t == 1 on.
++                // Matches kda_decode_step_kernel and k3_kda_chunk_prefill.cu.
+                 for (int j = 0; j < hd; ++j) {
+-                    const double decay = std::exp(gg[j]);
+                     double s = 0;
+                     for (int i = 0; i < hd; ++i) {
+-                        S[(size_t)j*hd+i] *= decay;
++                        S[(size_t)j*hd+i] *= std::exp(gg[i]);
+                         s += S[(size_t)j*hd+i] * kk[i];
+                     }
+                     sk[j] = s;
+@@ -385,7 +394,11 @@ int main(int argc, char** argv) {
+         cudaDeviceSynchronize();
+         if (!got_attn) { std::printf("  t=%d no debug capture\n", t); return 1; }
+         // forward_layer advances nothing itself; position drives the MLA KV slot.
+-        ++st.position;
++        // BOTH mirrors must move. A bare ++st.position left d_pos at 0, so every token
++        // wrote KV row 0 and attended over n_ctx == 1 while the reference cache grew.
++        if (!kimi_k3_set_position(st, st.position + 1)) {
++            std::printf("  t=%d set_position FAILED\n", t); return 1;
++        }
+
+         const double r = relL2(gpu_attn, attn_ref);
+         // Looser for MLA: more chained fp32 reductions (q_lora + two 512-wide
+--
+2.43.0

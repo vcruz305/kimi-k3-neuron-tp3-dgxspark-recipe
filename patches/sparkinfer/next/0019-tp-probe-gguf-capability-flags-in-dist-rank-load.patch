@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000f Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 13:40:00 -0700
+Subject: [PATCH] tp: 0019 probe GGUF capability flags in dist rank load
+
+CORRECTNESS FIX. The distributed path produced fluent-looking but wrong output
+on every prompt -- it failed a trivial repeating-token induction test -- because
+`KimiK3DistRank::opt` (a `K3PlanOptions`, kimi_k3_dist_rank.h:18) was NEVER
+ASSIGNED. Every flag in that struct defaults to false, and this file only ever
+read it: passing it to `kimi_k3_load_weights_scoped` and copying it to
+`out->fwd.opt`. Note the function's own `opt` PARAMETER is a different type
+(`KimiK3DistRankLoadOptions`, carrying only verbose/max_ctx/policy/load_embed),
+which is what makes the omission easy to miss on a read-through.
+
+`kimi_k3_load_weights_scoped` gates tensor uploads on those flags
+(kimi_k3.cpp:671-679), so weights that are PRESENT in the GGUF were never
+loaded and the ops that consume them were skipped entirely:
+
+  - shared experts   (ffn_gate_shexp / ffn_up_shexp / ffn_down_shexp)
+  - routed RMSNorm   (ffn_routed_norm)
+  - MLA q-lora       (attn_q_a / attn_q_b)
+  - MLA attn gate    (attn_gate)
+
+Nothing faults. Nothing is out of range. The affected layers just compute a
+wrong answer, which is why 93 layers of "working" engine shipped on top of it.
+
+On the real Kimi-K3 IQ1_S GGUF all four are present and all four were off:
+
+    [k3-dist] caps probe(blk.3): q_lora=1 attn_gate=1 shexp=1 routed_norm=1
+
+Localized by layer-by-layer bisection of the residual stream against an
+external oracle -- llama.cpp PR #26185 (commit 4158193ed, build b10381), the
+reference Kimi-K3 implementation -- fed byte-identical token ids:
+
+  - layer 0 matched at cos 0.999999; layer 1 was the FIRST divergence at
+    cos 0.874. This was at prompt position 0, a single token with no KV and no
+    recurrent state, which rules out any state/indexing explanation.
+  - layer 0 is the only dense-FFN layer (leading_dense_block_count=1) and
+    layers 0,1,2 are all KDA (head_count_kv=[0,0,0,1,...]), so layer 0 vs 1
+    differ in exactly one thing: dense FFN vs latent MoE.
+  - router logits, top-16 routing weights and the post-allreduce routed-expert
+    latent all matched at cos >= 0.9998 -- routing and expert math were never
+    wrong.
+  - two bitwise proofs of the skipped ops: the routed-norm input and output
+    dumps were MD5-identical (norm skipped), and ffn_out was MD5-identical to
+    the routed up-projection (shared expert never added).
+
+Fix: probe the GGUF for the optional tensors and set the flags, exactly as
+every `runtime/examples/*` harness already does (see kimi_k3_generate.cpp:109,
+kimi_k3_smoke_test.cpp:49, kimi_k3_tp_check.cpp:120 and 16 others). Only the
+production distributed path omitted it -- which is precisely why no
+SparkInfer-vs-SparkInfer test could ever catch it: the harnesses set the flags
+correctly and the engine under test did not.
+
+blk.3 is the probe layer because blk.0 is the leading DENSE layer and has no
+MoE tensors at all; probing it would false-negative shexp and routed_norm.
+
+The resolved flags are printed once per rank at load so a run's logs record
+what it actually ran rather than what the file happened to contain.
+
+Verified after the fix, same oracle, same token ids:
+  - all 93 layers match the reference at cos >= 0.99987 at prompt position 0
+  - the induction test returns the oracle's exact next token (was a repeated
+    junk token)
+  - "The capital of France is" now decodes to " Paris. Paris is the capital of
+    France." -- coherent, correct
+
+NOTE this supersedes the root-cause theory recorded in 0016's commit message,
+which attributed the collapse-to-one-repeated-token failure to IQ1_S
+quantization plus greedy decoding. That was wrong: the collapse was this bug.
+0016's repetition guard is still worth keeping as a decode-loop safety net, but
+it was treating a symptom.
+
+KNOWN GAP, not addressed here: at prompt positions > 0 the match against the
+reference is looser (cosine dipping to ~0.79-0.86 in a band around layers
+51-80, recovering by ~90-92). Suspected near-tied top-16 expert selection
+flipping under IQ1_S quantization noise. NOT confirmed. Output is coherent and
+first-token-exact; it is not verified byte-identical beyond that.
+---
+ runtime/src/models/kimi_k3_dist_rank.cpp | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/runtime/src/models/kimi_k3_dist_rank.cpp b/runtime/src/models/kimi_k3_dist_rank.cpp
+--- a/runtime/src/models/kimi_k3_dist_rank.cpp
++++ b/runtime/src/models/kimi_k3_dist_rank.cpp
+@@ -104,6 +104,26 @@ bool kimi_k3_dist_rank_load(const std::string& gguf_first_shard,
+     const bool load_head = (spec.rank == 0);
+     const bool load_embed = opt.load_embed_all_ranks || (spec.rank == 0);
+
++    // Capability flags are a property of the FILE and must be probed from it.
++    // They were never set here, so every one defaulted to false and the loader
++    // silently skipped weights that are present in the GGUF: the shared experts,
++    // the routed norm, and the MLA q-lora / attn-gate paths. Nothing faults --
++    // the affected layers just compute a wrong answer. Every runtime/examples/*
++    // harness does this probe, which is why none of them reproduced the fault.
++    {
++        const int probe = out->cfg.n_layers > 3 ? 3 : 0;
++        const std::string p = "blk." + std::to_string(probe) + ".";
++        out->opt.has_q_lora         = g.tensor((p + "attn_q_a.weight").c_str()) != nullptr;
++        out->opt.has_attn_gate      = g.tensor((p + "attn_gate.weight").c_str()) != nullptr;
++        out->opt.has_fused_kv_b     = false;
++        out->opt.has_shared_experts = g.tensor((p + "ffn_gate_shexp.weight").c_str()) != nullptr;
++        out->opt.has_routed_norm    = g.tensor((p + "ffn_routed_norm.weight").c_str()) != nullptr;
++        std::fprintf(stderr,
++                     "[k3-dist] caps probe(blk.%d): q_lora=%d attn_gate=%d shexp=%d routed_norm=%d\n",
++                     probe, (int)out->opt.has_q_lora, (int)out->opt.has_attn_gate,
++                     (int)out->opt.has_shared_experts, (int)out->opt.has_routed_norm);
++    }
++
+     if (!kimi_k3_load_weights_scoped(g, out->cfg, out->opt, out->weights,
+                                      /*first_layer=*/0,
+                                      /*last_layer=*/out->cfg.n_layers - 1, load_embed,
+--
+2.43.0

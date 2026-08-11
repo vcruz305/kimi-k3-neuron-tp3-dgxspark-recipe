@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000f Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 09:05:00 -0700
+Subject: [PATCH] tp: 0018 attention shard kill switches for the dist path
+
+The same-host TP path has had SPARKINFER_K3_SHARD_KDA / SPARKINFER_K3_SHARD_MLA
+since kimi_k3_tp.cpp:350. The DISTRIBUTED path had neither: it took
+ShardPolicy::ExpertsAndAttn from a struct default in kimi_k3_dist_rank.h and
+nothing ever assigned it, so attention sharding was the one major code path in
+the multi-Spark engine that could not be A/B'd against itself on one binary.
+Every other knob in the engine is same-binary switchable; this one was not, and
+it is the one that governs 93 layers of attention math.
+
+This adds the two switches to the dist path under the SAME NAMES, so a flag
+learned on one path means the same thing on the other. Unset means ON, so the
+default resolves to ExpertsAndAttn -- byte-for-byte the previous behavior. The
+resolved policy is printed once per rank at load so a run's logs record what it
+actually ran rather than what the launcher intended.
+
+Used to establish, on the live 3-Spark fleet, that MLA head sharding is
+numerically correct: with SPARKINFER_K3_SHARD_MLA=0 the per-layer residual
+stream matches the sharded run to relL2 8.2e-09 at the first MLA layer (layer
+3) -- i.e. pure float reassociation from summing 96 heads as 3x32 partials
+instead of all at once, which is exactly what a correct shard+all-reduce should
+cost. Downstream layers diverge chaotically from that 1e-8 seed (2e-4 by layer
+7, 5e-2 by layer 13), which is amplification, not error.
+
+NOTE ON MEMORY, since this bit me: SPARKINFER_K3_SHARD_KDA=0 does NOT fit on a
+121 GB GB10. Replicating the 69 KDA layers' attention at full width OOMs during
+load at blk.84.attn_k.weight, and turning both switches off OOMs at
+blk.82.attn_output.weight. Only the MLA switch is usable as a correctness A/B on
+this hardware; the KDA one needs a bigger box.
+
+DEPLOYMENT WARNING, unrelated to this patch but discovered while testing it:
+almost all engine code, including the whole dist forward, compiles into
+libsparkinfer_runtime.so, NOT into the kimi_k3_dist_generate executable, and
+dist/ is on LD_LIBRARY_PATH. Copying only the executable to the worker nodes
+ships a new launcher against the OLD runtime and fails SILENTLY -- no version
+check, no error, it just runs the previous code. Deploy both, and verify with
+  strings dist/libsparkinfer_runtime.so | grep <a string from your change>
+---
+ runtime/src/models/kimi_k3_dist_rank.cpp | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/models/kimi_k3_dist_rank.cpp b/runtime/src/models/kimi_k3_dist_rank.cpp
+--- a/runtime/src/models/kimi_k3_dist_rank.cpp
++++ b/runtime/src/models/kimi_k3_dist_rank.cpp
+@@ -4,6 +4,7 @@
+ #include "sparkinfer/models/kimi_k3_gguf_config.h"
+
+ #include <cstdio>
++#include <cstdlib>
+ #include <string>
+
+ namespace sparkinfer {
+@@ -93,7 +94,27 @@ bool kimi_k3_dist_rank_load(const std::string& gguf_first_shard,
+         return false;
+     }
+
+-    out->weights.policy = opt.policy;
++    // Attention-sharding kill switches, same flag names as the same-host TP path
++    // (kimi_k3_tp.cpp). The dist path hardcoded ExpertsAndAttn with no override,
++    // which left attention sharding the one major path that could not be A/B'd
++    // against itself on one binary. Unset => on => ExpertsAndAttn, i.e. no change.
++    {
++        auto shard_on = [](const char* n) {
++            const char* e = std::getenv(n);
++            return !(e && e[0] == '0');
++        };
++        const bool k = shard_on("SPARKINFER_K3_SHARD_KDA") && spec.world_size > 1;
++        const bool m = shard_on("SPARKINFER_K3_SHARD_MLA") && spec.world_size > 1;
++        const KimiK3Weights::ShardPolicy p =
++            (k && m) ? KimiK3Weights::ShardPolicy::ExpertsAndAttn :
++            k        ? KimiK3Weights::ShardPolicy::ExpertsAndKda  :
++            m        ? KimiK3Weights::ShardPolicy::ExpertsAndMla  :
++                       KimiK3Weights::ShardPolicy::ExpertsOnly;
++        std::fprintf(stderr, "[k3-dist] rank%d shard policy=%d (shard_kda=%d shard_mla=%d)\n",
++                     spec.rank, (int)p, (int)k, (int)m);
++        out->weights.policy = p;
++    }
+     out->weights.shard = out->plan.dims;
+     out->weights.shard.tp_size = spec.world_size;
+     out->weights.shard.rank = spec.rank;
+--
+2.43.0

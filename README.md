@@ -2,14 +2,27 @@
 
 Serves the 330 GB Kimi-K3 Neuron IQ1_S GGUF across 3 or 4 NVIDIA DGX Spark (GB10) nodes.
 
-> **⚠️ Known issue under active investigation (as of 2026-08-11): do not deploy yet.**
-> Testing has found that the distributed (TP3/TP4) generation path produces incoherent
-> output — it fails even a trivial repeating-token continuation test, independent of
-> quantization, decoding settings, or chat template. This points to a bug in either the
-> engine's distributed execution path or the GGUF itself; root cause is not yet found.
-> Loading and running both work (the speed numbers below are real), but the generated
-> *text* should not be trusted until this notice is removed. This line supersedes any
-> "working end-to-end" framing elsewhere in this repo until resolved.
+> **✅ Correctness fix applied and verified, 2026-08-11.** The distributed (TP3/TP4)
+> generation path had a bug in `kimi_k3_dist_rank.cpp`: it never set the GGUF capability
+> flags that gate loading, so the shared experts, the routed-expert normalization, and the
+> MLA attention gate were silently skipped on every token — real weights present in the
+> file, never loaded, never computed. No crash, no NaN, just wrong output. Fixed by adding
+> the same capability probe every other code path already had.
+>
+> Verified against the actual upstream Kimi-K3 architecture (an in-progress llama.cpp PR
+> implementing this model natively, run independently as a reference): first-token
+> prediction is now oracle-exact on every prompt tested, and previously-garbled output is
+> coherent English. **Honest caveat, not yet fully explained**: beyond the first few tokens
+> of a longer context, SparkInfer's output can drift from a bit-perfect reference (both
+> stay fluent, but the exact wording can differ) — plausibly near-tied expert routing under
+> 1-bit quantization flipping which experts get picked, not confirmed. Read this as
+> "mechanism fixed, coherent, closely matches a reference at short range" — not "verified
+> byte-identical to any reference implementation."
+>
+> **The speed numbers below predate this fix** and were measured on an engine skipping
+> real computation — they do not apply to the corrected engine and are being re-measured.
+> Expect the real number to be lower, since the fix makes the engine do more work per
+> token, not less.
 
 | | |
 |---|---|

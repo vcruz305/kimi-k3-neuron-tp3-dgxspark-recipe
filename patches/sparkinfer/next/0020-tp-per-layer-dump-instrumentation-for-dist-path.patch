@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000f Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 13:45:00 -0700
+Subject: [PATCH] tp: 0020 per-layer dump instrumentation for the dist path
+
+DEBUG TOOLING, not a behavior change. Adds the env-gated activation dumps that
+the distributed path never had.
+
+`K3_DUMP_DIR` / `K3_SUBTAP_LAYER` already existed, but ONLY in
+`kimi_k3_pipeline_forward` (kimi_k3.cpp:3855-3890) -- the single-process
+multi-GPU pipeline. `kimi_k3_dist_forward_token` had no instrumentation of any
+kind. That is why the distributed engine's wrong output could not be bisected
+for so long: the one path that was broken was the one path with no way to look
+inside it. Closing that gap is what located 0019.
+
+Adds, all under the same env vars so a habit learned on one path transfers:
+
+  - `K3_DUMP_DIR=<dir>` writes, per forward call, the post-layer residual
+    stream for every layer plus the embedding, the final norm and the logits.
+  - `K3_SUBTAP_LAYER=<L>` additionally wires `fwd.debug`, giving the per-op
+    sub-taps inside one target layer (attn_norm, kda_*, mla_*, ffn_norm,
+    dbg_router_*, dbg_moe_*, dbg_shexp*, ffn_out).
+
+Filenames are `our_<tag>-<layer>.s<step>.r<rank>.bin`, raw float32:
+
+  - `<tag>-<layer>` deliberately mirrors llama.cpp's `l_out-<L>` tensor naming
+    so the two engines' dumps diff directly, tag for tag.
+  - `.s<step>` is the forward-call index. Without it every prompt token
+    overwrites the previous one's dump and only the last position is
+    observable -- which hides exactly the position-dependent behavior worth
+    looking for.
+  - `.r<rank>` because a tap taken INSIDE a layer is that rank's pre-allreduce
+    PARTIAL, not the full value. Comparing a partial against a reference's
+    full-width tensor looks like a catastrophic divergence and is not one; the
+    post-collective tags are the ones that must match.
+
+Zero cost when unset: `k3_dump_dir()` caches a single `getenv`, `dump_on` is
+then a constant-folded branch per layer, and `fwd.debug` stays null so no tap
+fires. Nothing else on the dist path writes `fwd.debug`, so clearing it at the
+top of each forward is not a regression. Independently confirmed inert by a
+verification pass; tok/s measured on a binary carrying this patch is valid.
+---
+ runtime/src/models/kimi_k3_dist_forward.cpp | 61 +++++++++++++++++++++++++++++
+ 1 file changed, 61 insertions(+)
+
+diff --git a/runtime/src/models/kimi_k3_dist_forward.cpp b/runtime/src/models/kimi_k3_dist_forward.cpp
+--- a/runtime/src/models/kimi_k3_dist_forward.cpp
++++ b/runtime/src/models/kimi_k3_dist_forward.cpp
+@@ -29,6 +29,33 @@ void set_err(std::string* error, const std::string& v) {
+     if (error) *error = v;
+ }
+
++// Debug localization, env-gated by K3_DUMP_DIR. The distributed path had no
++// dump instrumentation at all -- only the single-process pipeline path did --
++// so cross-engine bisection against llama.cpp was previously impossible here.
++// Files are named to line up with llama.cpp's `l_out-<L>` tensor tags.
++const char* k3_dump_dir() {
++    static const char* d = std::getenv("K3_DUMP_DIR");
++    return d;
++}
++
++void k3_dump_dev(const char* tag, int layer, int step, int rank_id, const float* dev, int64_t n,
++                 cudaStream_t stream) {
++    const char* dd = k3_dump_dir();
++    if (!dd || !dev || n <= 0) return;
++    cudaStreamSynchronize(stream);
++    std::vector<float> hb((size_t)n);
++    if (cudaMemcpy(hb.data(), dev, (size_t)n * sizeof(float), cudaMemcpyDeviceToHost) !=
++        cudaSuccess) {
++        return;
++    }
++    char pth[512];
++    std::snprintf(pth, sizeof(pth), "%s/our_%s-%d.s%d.r%d.bin", dd, tag, layer, step, rank_id);
++    if (FILE* f = std::fopen(pth, "wb")) {
++        std::fwrite(hb.data(), sizeof(float), (size_t)n, f);
++        std::fclose(f);
++    }
++}
++
+ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
+                  float* x, cudaStream_t stream) {
+     if (!w.token_embd.ok()) return false;
+@@ -223,6 +250,27 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+
+     rank.state.n_ckpt = 0;
+
++    // Debug localization: forward-call index, so per-token dumps do not
++    // overwrite each other and a specific prompt position can be compared.
++    static int k3_dump_step = -1;
++    ++k3_dump_step;
++    const int dump_step = k3_dump_step;
++    const bool dump_on = k3_dump_dir() != nullptr;
++
++    fwd.debug = nullptr;
++    if (dump_on) {
++        if (const char* sl = std::getenv("K3_SUBTAP_LAYER")) {
++            const int target = std::atoi(sl);
++            const int rid = my_rank;
++            cudaStream_t dbg_stream = rank.stream;
++            fwd.debug = [target, rid, dump_step, dbg_stream](const char* tag, int layer,
++                                                             const float* dev, int64_t n) {
++                if (layer != target) return;
++                k3_dump_dev(tag, layer, dump_step, rid, dev, n, dbg_stream);
++            };
++        }
++    }
++
+     auto run_embed = [&]() {
+         return embed_token(w, cfg, token_id, rank.x, rank.stream);
+     };
+@@ -238,6 +286,10 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+         }
+     }
+
++    if (dump_on) {
++        k3_dump_dev("inp_embd", -1, dump_step, my_rank, rank.x, H, rank.stream);
++    }
++
+     long n_coll = 0;
+     for (int layer = 0; layer < cfg.n_layers; ++layer) {
+         const bool is_moe = layer >= cfg.leading_dense;
+@@ -344,6 +396,11 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+             return false;
+         }
+         std::swap(rank.x, rank.x_next);
++        // After the swap rank.x holds this layer's residual-stream output, which
++        // is exactly llama.cpp's `l_out-<L>`.
++        if (dump_on) {
++            k3_dump_dev("l_out", layer, dump_step, my_rank, rank.x, H, rank.stream);
++        }
+         if (!do_prof && (layer == 0 || layer + 1 == cfg.n_layers || ((layer + 1) % 16) == 0)) {
+             char buf[128];
+             std::snprintf(buf, sizeof(buf), "rank%d layer %d/%d done coll=%ld", my_rank, layer + 1,
+@@ -379,6 +436,10 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+                 set_err(error, "lm head proj failed");
+                 return false;
+             }
++            if (dump_on) {
++                k3_dump_dev("result_norm", -1, dump_step, my_rank, rank.x_next, H, rank.stream);
++                k3_dump_dev("logits", -1, dump_step, my_rank, rank.logits, cfg.vocab, rank.stream);
++            }
+             return true;
+         };
+         if (do_prof) {
+--
+2.43.0
