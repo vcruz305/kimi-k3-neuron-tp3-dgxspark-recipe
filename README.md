@@ -1,7 +1,7 @@
 # Kimi-K3 Neuron — multi-Spark TP3/TP4 (SparkInfer)
 
 Serves the 330 GB Kimi-K3 Neuron IQ1_S GGUF across 3 or 4 NVIDIA DGX Spark (GB10) nodes.
-**Working end-to-end, this is the recommended path** — not a drop-in production API server.
+**Working end-to-end, this is the recommended path.**
 
 | | |
 |---|---|
