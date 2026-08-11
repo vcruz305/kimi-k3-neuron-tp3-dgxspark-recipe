@@ -1,0 +1,137 @@
+From 771a1f14e4fb80082fb4eb57c094f477dfeea52c Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 00:52:13 -0500
+Subject: [PATCH] tp: 0013 pin per-tensor host memory for fast GGUF load
+
+cudaMemcpy/cudaMemcpy2D from the plain mmap in gguf.cpp forced the driver
+through a pageable-memory bounce-buffer copy for every tensor upload.
+Confirmed via nsys: cudaMemcpy/cudaMemcpy2D were 99.5% of load-phase CUDA
+API time, individual calls up to 5s for tensors that should transfer in
+milliseconds -- this is the real cause of the ~30-60 min/rank multi-Spark
+load time, not disk I/O (raw sequential shard read measured at 2.2-18 GB/s).
+
+Registers each tensor byte range as pinned host memory immediately before
+its H2D copy (ScopedHostRegister, RAII, best-effort) so the driver can DMA
+directly instead of staging. Scoped per-tensor rather than per-shard:
+GGUF split shards all stay mmapped concurrently for the life of the load,
+so registering whole shards tries to pin the ~330 GB model at once and
+blows past both physical RAM and RLIMIT_MEMLOCK (measured: 6/9 shards
+failed to register with ENOMEM). Per-tensor keeps peak additional pinned
+memory bounded to a single tensor.
+
+Measured end-to-end on the real 3-Spark fleet: full load+generate dropped
+from the previous ~30-60 min/rank baseline to ~5m45s, all 3 ranks finished
+clean, decode unaffected (5.99 tok/s, matches prior TP3 baseline) since
+this only touches the load-time copy path, never the forward pass.
+---
+ runtime/src/gguf.cpp           |  4 ++-
+ runtime/src/models/kimi_k3.cpp | 50 ++++++++++++++++++++++++++++++++--
+ 2 files changed, 50 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/src/gguf.cpp b/runtime/src/gguf.cpp
+index da48eeb..b227535 100644
+--- a/runtime/src/gguf.cpp
++++ b/runtime/src/gguf.cpp
+@@ -161,7 +161,9 @@ void GGUF::unmap_file(MappedFile& mf) {
+     if (mf.win_file && mf.win_file != INVALID_HANDLE_VALUE) CloseHandle((HANDLE)mf.win_file);
+     mf.base = nullptr; mf.win_map = nullptr; mf.win_file = INVALID_HANDLE_VALUE; mf.size = 0;
+ #else
+-    if (mf.base && mf.base != MAP_FAILED) munmap(mf.base, mf.size);
++    if (mf.base && mf.base != MAP_FAILED) {
++        munmap(mf.base, mf.size);
++    }
+     if (mf.fd >= 0) close(mf.fd);
+     mf.base = nullptr; mf.fd = -1; mf.size = 0;
+ #endif
+diff --git a/runtime/src/models/kimi_k3.cpp b/runtime/src/models/kimi_k3.cpp
+index e48d794..9c9d516 100644
+--- a/runtime/src/models/kimi_k3.cpp
++++ b/runtime/src/models/kimi_k3.cpp
+@@ -111,6 +111,32 @@ bool kv_f16_on()   { return !env_zero("SPARKINFER_K3_KV_F16"); }
+ // mid-quantisation-block is unrecoverable and undetectable — right shape, right byte
+ // count, noise for values. The planner bands over BLOCKS so every cut is legal by
+ // construction; re-deriving offsets here would put that guarantee back at risk.
++// Registers a tensor's byte range as pinned host memory for the duration of one
++// H2D transfer, so the driver can DMA directly from these pages instead of
++// staging through a bounce buffer -- confirmed via nsys to be the dominant load
++// cost on GB10 (cudaMemcpy/cudaMemcpy2D from the plain mmap in gguf.cpp were
++// 99.5% of load-phase CUDA API time, individual calls up to several seconds for
++// tensors that should transfer in milliseconds). Scoped to one tensor at a time
++// rather than the whole shard mapping: every GGUF shard stays mmap'd for the
++// life of the load (tensors are pulled from any shard at any point), so
++// registering whole shards tries to pin the entire ~330 GB model concurrently
++// and blows past both physical RAM and RLIMIT_MEMLOCK. Best-effort: a failed
++// register just forgoes the speedup for this one tensor and falls back to the
++// same (always-correct) unpinned copy.
++struct ScopedHostRegister {
++    void* ptr;
++    bool registered;
++    ScopedHostRegister(const void* p, size_t bytes)
++        : ptr(const_cast<void*>(p)),
++          registered(bytes > 0 &&
++                     cudaHostRegister(ptr, bytes, cudaHostRegisterDefault) == cudaSuccess) {}
++    ~ScopedHostRegister() {
++        if (registered) cudaHostUnregister(ptr);
++    }
++    ScopedHostRegister(const ScopedHostRegister&) = delete;
++    ScopedHostRegister& operator=(const ScopedHostRegister&) = delete;
++};
++
+ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
+                    KimiK3Tensor& out, bool required, bool kda_layer) {
+     const GGUFTensor* t = g.tensor(name);
+@@ -128,7 +154,12 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
+                          name.c_str(), t->n_bytes);
+             return false;
+         }
+-        if (cudaMemcpy(d, t->data, (size_t)t->n_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
++        cudaError_t cpy;
++        {
++            ScopedHostRegister reg(t->data, (size_t)t->n_bytes);
++            cpy = cudaMemcpy(d, t->data, (size_t)t->n_bytes, cudaMemcpyHostToDevice);
++        }
++        if (cpy != cudaSuccess) {
+             std::fprintf(stderr, "[k3] cudaMemcpy failed for %s\n", name.c_str());
+             cudaFree(d);
+             return false;
+@@ -215,8 +246,12 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
+                              name.c_str(), t->n_bytes);
+                 return false;
+             }
+-            if (cudaMemcpy(d, t->data, (size_t)t->n_bytes, cudaMemcpyHostToDevice)
+-                    != cudaSuccess) {
++            cudaError_t cpy;
++            {
++                ScopedHostRegister reg(t->data, (size_t)t->n_bytes);
++                cpy = cudaMemcpy(d, t->data, (size_t)t->n_bytes, cudaMemcpyHostToDevice);
++            }
++            if (cpy != cudaSuccess) {
+                 std::fprintf(stderr, "[k3] cudaMemcpy failed for %s\n", name.c_str());
+                 cudaFree(d);
+                 return false;
+@@ -276,6 +311,7 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
+     cudaError_t e;
+     if (c.contiguous()) {
+         // RowShard / ExpertShard / Replicate: one band of whole memory rows.
++        ScopedHostRegister reg(src + c.src_offset, c.total_bytes());
+         e = cudaMemcpy(dst + c.dst_offset, src + c.src_offset, c.total_bytes(),
+                        cudaMemcpyHostToDevice);
+     } else {
+@@ -292,6 +328,14 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
+         // better. Decode was identical, so it was correct and just slower. Left as this
+         // note rather than deleted, so the next person sizing up this line does not
+         // spend the same afternoon on it.
++        //
++        // Registering here still applies, and is a different fix from the rejected
++        // gather above: it doesn't touch the copy shape or add a staging pass, it just
++        // lets the driver DMA the same strided walk from pinned pages instead of a
++        // pageable bounce buffer. Span covers every row cudaMemcpy2D will touch, not
++        // just row 0 — the rows are not contiguous, so total_bytes() would undercount.
++        const size_t span = (size_t)(c.n_rows - 1) * c.src_stride + c.row_bytes;
++        ScopedHostRegister reg(src + c.src_offset, span);
+         e = cudaMemcpy2D(dst + c.dst_offset, c.dst_stride,
+                          src + c.src_offset, c.src_stride,
+                          c.row_bytes, (size_t)c.n_rows,
+-- 
+2.43.0
+

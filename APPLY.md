@@ -1,7 +1,7 @@
 # APPLY.md — SparkInfer K3 multi-Spark patch chain
 
 **Base:** `7a9b77a043596157d74e4af376cf9f29f68ce368`  
-**Tip:** `main` / tag `sparkinfer-tp3-phase3-loadready-fix` — **git am 0001–0012**
+**Tip:** `main` — **git am 0001–0013**
 
 ## Apply
 
@@ -22,7 +22,9 @@ for p in \
   /tmp/k3-recipe/patches/sparkinfer/next/0008-tp-fix-rank0-loadready-oneshot-and-load-before-ready.patch \
   /tmp/k3-recipe/patches/sparkinfer/next/0009-tp-f16-token-embd-output-and-dist-embed.patch \
   /tmp/k3-recipe/patches/sparkinfer/next/0010-tp-first-forward-stall-instrumentation.patch \
-  /tmp/k3-recipe/patches/sparkinfer/next/0011-tp-finish-deadlock-and-decode-tps.patch \n  /tmp/k3-recipe/patches/sparkinfer/next/0012-tp-finish-ack-after-wait-token.patch
+  /tmp/k3-recipe/patches/sparkinfer/next/0011-tp-finish-deadlock-and-decode-tps.patch \
+  /tmp/k3-recipe/patches/sparkinfer/next/0012-tp-finish-ack-after-wait-token.patch \
+  /tmp/k3-recipe/patches/sparkinfer/next/0013-tp-pin-per-tensor-host-memory-for-fast-load.patch
 do git am "$p"; done
 
 cmake -S runtime -B build -DSPARKINFER_TP=ON
@@ -38,12 +40,28 @@ cmake --build build -j"$(nproc)" --target kimi_k3_dist_generate \
 | 0008 | LoadReady one-shot (GB10 verified) |
 | 0009 | F16 embed (GB10 verified) |
 | 0010 | first-forward breadcrumbs → **GENERATE_PASS** |
-| **0011** | **finish deadlock fix + decode tok/s lines** |
+| 0011 | finish deadlock fix + decode tok/s lines |
+| 0012 | FinishAck after wait_token (teardown hang) |
+| **0013** | **pin per-tensor host memory — load time fix (primary path)** |
 
 ### 0011
 - `finish()` no longer holds `mu_` while waiting (unblocks rx FinishAcks)
 - injects rank0 `FinishAck` once
 - prints `decode_tok_s` / `prefill_tok_s` + `generated_ids` (fflush)
+
+### 0013
+- Root cause (via `nsys`): `cudaMemcpy`/`cudaMemcpy2D` from the plain `mmap` in
+  `gguf.cpp` forced the driver through a pageable-memory bounce-buffer copy for
+  every tensor upload — 99.5% of load-phase CUDA API time, individual calls up
+  to 5s each. Not disk I/O (raw sequential shard read measured 2.2–18 GB/s).
+- Fix: `ScopedHostRegister` (RAII `cudaHostRegister`/`cudaHostUnregister`)
+  wraps each tensor's H2D copy, scoped **per tensor** — not per shard, since all
+  9 GGUF split shards stay mmapped for the life of the load and pinning whole
+  shards tries to lock the ~330 GB model at once (measured: 6/9 shards failed
+  to register with ENOMEM before this fix was narrowed to per-tensor).
+- Measured on the real 3-Spark fleet: full load+generate **~30–60 min/rank →
+  ~5m45s**. Decode unaffected (5.99 tok/s) — this only touches the load-time
+  copy path, never the forward pass.
 
 ## TPS measurement run
 

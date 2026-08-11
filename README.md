@@ -2,15 +2,22 @@
 
 **Status: working e2e on 3- and 4-Spark fleets — not a drop-in production API server.**
 
-Patches **0001–0012** deliver load → multi-prompt generate → finish on **DGX Spark** with
-rank-local GGUF residency and NCCL collectives.
+**This is the primary/recommended path for serving Kimi-K3 Neuron TP3 across multiple
+DGX Sparks.** The alternative vLLM/GGUF-plugin TP3 path
+([`kimi-k3-neuron-tp3-vllm-recipe`](https://github.com/vcruz305/kimi-k3-neuron-tp3-vllm-recipe))
+was tested to the physical memory ceiling on the real 3-Spark fleet and found infeasible at the
+current quantization width (k=1536) — see [Related: vLLM path](#related-vllm-path) below.
+
+Patches **0001–0013** deliver load → multi-prompt generate → finish on **DGX Spark** with
+rank-local GGUF residency and NCCL collectives. **0013 fixes per-rank load time from
+~30–60 min down to ~5m45s** — see [Load time](#load-time-0013) below.
 
 | | |
 |---|---|
 | **This recipe** | [`github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe`](https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe) |
 | **Model (GGUF)** | [`huggingface.co/vcruz305/Kimi-K3-Neuron-IQ1S-GGUF`](https://huggingface.co/vcruz305/Kimi-K3-Neuron-IQ1S-GGUF) (~330 GB / 307.49 GiB) |
 | Upstream base | `gittensor-ai-lab/sparkinfer-k3` @ `7a9b77a043596157d74e4af376cf9f29f68ce368` |
-| Patch tip | **0001–0012** — see [`APPLY.md`](APPLY.md) |
+| Patch tip | **0001–0013** — see [`APPLY.md`](APPLY.md) |
 
 ---
 
@@ -19,6 +26,25 @@ rank-local GGUF residency and NCCL collectives.
 Hardware: NVIDIA **DGX Spark** (GB10). Weights on **local NVMe** (not NFS/sshfs).  
 Flags: `max_ctx=8192`, `SPARKINFER_K3_MOE_WEPS=0`, `SPARKINFER_K3_GRAPH=0`, `NCCL_NVLS_ENABLE=0`.  
 Binary: `kimi_k3_dist_generate` (multi-prompt + KV reset `-2`).
+
+### Load time (0013)
+
+| | Before 0013 | After 0013 |
+|---|---:|---:|
+| Per-rank load (3-Spark TP3) | ~30–60 min | **~5m45s** |
+
+Root cause (confirmed via `nsys` CUDA API trace, not guesswork): every tensor upload in
+`gguf.cpp`/`kimi_k3.cpp` did `cudaMemcpy`/`cudaMemcpy2D` straight out of a plain `mmap`.
+Pageable (unregistered) host memory forces the CUDA driver through a staged bounce-buffer
+copy instead of DMA'ing directly — on GB10 this was **99.5% of load-phase CUDA API time**,
+individual calls up to 5s each for tensors that should transfer in milliseconds. Disk I/O
+was ruled out first (raw sequential shard read measured 2.2–18 GB/s — nowhere near the
+bottleneck). Fix pins each tensor's host memory immediately before its H2D copy
+(`cudaHostRegister`/`cudaHostUnregister`, RAII, best-effort), scoped **per tensor** rather
+than per shard — see `### 0013` in [`APPLY.md`](APPLY.md) for why per-shard registration
+was tried first and rejected (ENOMEM: GGUF split shards all stay mmapped concurrently for
+the life of the load, so pinning whole shards tries to lock the ~330 GB model at once).
+Decode throughput is unaffected (fix only touches the load-time copy path).
 
 ### 3× Spark — TP3 `AllExpertsFfnWidth` (FFN 512/512/512 · ~113 GiB/rank)
 
@@ -124,7 +150,7 @@ Entry shard:
 $HOME/models/kimi-k3-neuron-iq1s-local/k3-neuron-iq1s-00001-of-00009.gguf
 ```
 
-### 2. Build + apply patches 0001–0012
+### 2. Build + apply patches 0001–0013
 
 See **[`APPLY.md`](APPLY.md)**. Build targets should include `kimi_k3_dist_generate` and ship:
 
@@ -211,10 +237,20 @@ Report **median tok/s dropping prompt0** (cold window after load).
 ---
 
 
-## Related: vLLM path (next engine test on Sparks)
+## Related: vLLM path
 
-Separate recipe: [`vcruz305/kimi-k3-neuron-tp3-vllm-recipe`](https://github.com/vcruz305/kimi-k3-neuron-tp3-vllm-recipe) — qualified on **3×H200** (~34 t/s graph target-only).  
-On **DGX Spark** this is **not** drop-in (1 GPU/node): needs multi-node TP or build smoke first. Staging notes live with the operator workspace (`SPARK-VLLM-NEXT.md`).
+Separate recipe: [`vcruz305/kimi-k3-neuron-tp3-vllm-recipe`](https://github.com/vcruz305/kimi-k3-neuron-tp3-vllm-recipe) — qualified on **3×H200** (~34 t/s graph target-only).
+
+Tested directly on the physical 3-Spark fleet (Ray-orchestrated vLLM + GGUF plugin, with the
+zero-copy `weight_utils.py` fix ported in): measured to be at or beyond the genuine physical
+memory ceiling at the current quantization width (k=1536) — confirmed by an independent
+watchdog tripping at literal 0 bytes free, Ray's own OOM monitor firing separately, and a real
+host wedge at the most aggressive settings. Not a config/tuning gap. An intermediate prune
+width (k=1280) is the next thing to try there, not further memory-margin tuning.
+
+**This SparkInfer path does not have that ceiling** (~113 GiB/rank at TP3, comfortably under
+GB10's 121 GiB) and is proven working end-to-end — use this recipe unless/until the vLLM path
+clears its memory deficit.
 
 ## Non-claims
 
