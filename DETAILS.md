@@ -222,6 +222,7 @@ Report **median tok/s dropping prompt0** (cold window after load).
 | [`docs/TP3-DECODE-PROFILE.md`](docs/TP3-DECODE-PROFILE.md) | TP3 profile: attn **36.5%** · MoE **23.5%** · coll **~26%** |
 | [`docs/TP4-SPEED-RESULTS.md`](docs/TP4-SPEED-RESULTS.md) | TP4 profile, NCCL, GRAPH A/B, syncfix median **7.945** |
 | [`docs/TP3-EXPLAINED-AND-FIXED.md`](docs/TP3-EXPLAINED-AND-FIXED.md) | TP3 design |
+| [`docs/TP3-KERNEL-FLAG-SWEEP.md`](docs/TP3-KERNEL-FLAG-SWEEP.md) | All 27 `SPARKINFER_K3_*` kernel flags tested on GB10 — what helped (`KDA_FUSE=0`, +20%), what didn't, what not to re-try |
 
 ---
 
