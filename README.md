@@ -1,50 +1,37 @@
-# Kimi-K3 Neuron on 3 DGX Sparks
+# Kimi-K3 Neuron with SparkInfer
 
-Run the 330 GB Kimi-K3 Neuron IQ1_S GGUF across three NVIDIA DGX Spark nodes with
-the SparkInfer TP3 patch and opt-in speculative decoding. The included HTTP bridge
-speaks the OpenAI `POST /v1/chat/completions` schema, so Hermes and other
-OpenAI-compatible agents can use it without a custom client.
+Run the 330 GB Kimi-K3 Neuron IQ1_S GGUF with the SparkInfer patch series,
+distributed tensor parallelism, and optional repeat-aware speculative decoding. The
+included API bridge speaks OpenAI `POST /v1/chat/completions`, so Hermes and other
+OpenAI-compatible agents work without a custom client.
 
-## What this release proves
+## Release scope
 
-- The SparkInfer patch series through **0026** clean-applies to the pinned upstream
-  base, builds on GB10, and includes the distributed-loader correctness fix. Apply
-  the complete series; older throughput measurements from before patch 0019 are not
-  valid model results.
-- On three real DGX Sparks, the repeat-heavy/structured speculative profile measured
-  **12.5468** and **12.5516 tok/s** around a **6.4930 tok/s** matched baseline
-  (**12.5492 tok/s** candidate average). Both candidate runs accepted 112/112 drafted
-  tokens and emitted identical token IDs.
-- That is a deliberately narrow claim: it is not general-purpose or prose throughput.
-  The same profile measured **6.5893 tok/s** on freeform prose and **9.7937 tok/s**
-  across its four-request mix. Use normal greedy decoding when a workload does not
-  benefit from repeat-aware drafting.
+- **Qualified configuration:** TP3 on three DGX Sparks (GB10 / SM121), with the
+  complete patch series through 0026.
+- The structured/repeat-heavy K=8/P8 profile measured **12.5492 decode tok/s**
+  candidate average (12.5468 and 12.5516) against a 6.4930 matched baseline. It is
+  not a general chat, concurrency, long-context, or prose claim: freeform prose was
+  6.5893 tok/s and the four-request mix was 9.7937 tok/s.
+- **TP4 is experimental.** The patched runtime implements the `world=4`
+  ExpertFfn2D plan and the distributed/speculative serve path accepts it, but the
+  K=8/P8 profile is qualified only for TP3. Do not quote a TP4 speed from this release.
 
-Full receipts: [12.5 TPS benchmark](evidence/specdec-k8-p8-12tps-RECEIPT.md) and
-[patch/build status](APPLY.md). The service is a single sequential model instance:
-one request at a time, greedy decoding, no sampling, and no parsed tool-call output.
+Read [WHAT_NOT_TO_TEST.md](WHAT_NOT_TO_TEST.md) before benchmarking. The complete
+patch and validation chain is in [APPLY.md](APPLY.md).
 
 ## Prerequisites
 
-You need three GB10-based DGX Sparks on a private/fabric network, SSH between them,
-CUDA/NCCL installed, and at least 320 GB of **local NVMe** free on every node. Do not
-load the GGUF through NFS or SSHFS. You also need access to the gated GGUF and the
-official `moonshotai/Kimi-K3` Hugging Face repositories.
+Each participating machine needs CUDA/NCCL, local NVMe (at least 320 GB free), the
+same model shard path, and the IQ1_S GGUF **on its own local disk**. Do not use NFS
+or SSHFS. Use a private fabric address for cluster coordination, not a management
+gateway. The API adapter is a trusted-network, one-request bridge; put TLS and rate
+limits in front of it before public exposure.
 
-The commands below use these example fabric addresses. Set them to your three nodes
-once, then keep rank 0's address identical in every command.
+The `dist/` directory contains only the executable and runtime libraries. It is small
+enough to copy; the 330 GB model is deliberately never copied by the launcher.
 
-```bash
-export RANK0=10.10.10.2
-export RANK1=10.10.10.4
-export RANK2=10.10.10.6
-export K3_HOME=$HOME/k3-neuron
-```
-
-## 1. Download model and tokenizer on every Spark
-
-Run this block once on **each** Spark. It downloads the GGUF locally and only the
-small tokenizer files needed by the API bridge (not the original full-precision model).
+## 1. Download the model and tokenizer on every participating machine
 
 ```bash
 python3 -m pip install -U "huggingface_hub[hf_xet]"
@@ -53,119 +40,130 @@ export HF_XET_HIGH_PERFORMANCE=1
 export K3_HOME=$HOME/k3-neuron
 mkdir -p "$K3_HOME/model" "$K3_HOME/tokenizer"
 
-hf download vcruz305/Kimi-K3-Neuron-IQ1S-GGUF \
-  --local-dir "$K3_HOME/model" \
+hf download vcruz305/Kimi-K3-Neuron-IQ1S-GGUF --local-dir "$K3_HOME/model" \
   --include "*.gguf" --include "k3_chat_template.jinja"
-
-hf download moonshotai/Kimi-K3 \
-  --local-dir "$K3_HOME/tokenizer" \
+hf download moonshotai/Kimi-K3 --local-dir "$K3_HOME/tokenizer" \
   --include "config.json" --include "generation_config.json" \
-  --include "tokenization_kimi.py" --include "tiktoken.model" \
-  --include "tokenizer_config.json"
+  --include "tokenization_kimi.py" --include "tiktoken.model" --include "tokenizer_config.json"
 
 test -f "$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf"
-test -f "$K3_HOME/model/k3_chat_template.jinja"
 test -f "$K3_HOME/tokenizer/tokenization_kimi.py"
-test -f "$K3_HOME/tokenizer/tiktoken.model"
 ```
 
-## 2. Build SparkInfer with the TP3 + speculative-decoding patch
+## 2. Build once and package the runtime distribution
 
-Run on rank 0. The helper applies the exact, ordered 28-patch series. It stops if
-the checkout is not the pinned base or has uncommitted changes.
+Run this on the machine that will be the **coordinator**. For a mixed SM120/SM121
+fleet, build a fat binary as shown. A homogeneous fleet may set only its own
+architecture instead. Your CUDA toolchain must recognize every requested architecture.
 
 ```bash
 export K3_HOME=$HOME/k3-neuron
 mkdir -p "$K3_HOME/src"
-git clone --depth 1 --branch main \
-  https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe \
+git clone --depth 1 --branch main https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe \
   "$K3_HOME/src/recipe"
-git clone https://github.com/gittensor-ai-lab/sparkinfer-k3.git \
-  "$K3_HOME/src/sparkinfer-k3"
+git clone https://github.com/gittensor-ai-lab/sparkinfer-k3.git "$K3_HOME/src/sparkinfer-k3"
 cd "$K3_HOME/src/sparkinfer-k3"
 bash "$K3_HOME/src/recipe/scripts/apply_sparkinfer_patch_series.sh" "$K3_HOME/src/recipe"
 
-cmake -S runtime -B build -DSPARKINFER_TP=ON
+cmake -S runtime -B build -DSPARKINFER_TP=ON -DCMAKE_CUDA_ARCHITECTURES="120;121"
 cmake --build build -j"$(nproc)" --target kimi_k3_dist_generate \
   tp_rank_local_loader_cpu_test tp_dist_generate_protocol_cpu_test \
   kimi_k3_tp_kda_check kimi_k3_tp_width_check kimi_k3_kda_batch_check \
   kimi_k3_spec_draft_check kimi_k3_tune_check
 ctest --test-dir build --output-on-failure
-```
 
-Package the executable and runtime libraries, then copy exactly that directory to the
-other two ranks. Do not mix a fresh executable with stale `.so` files.
-
-```bash
-export K3_HOME=$HOME/k3-neuron
-cd "$K3_HOME/src/sparkinfer-k3"
 mkdir -p "$K3_HOME/dist"
-BIN=$(find build -type f -name kimi_k3_dist_generate -print -quit)
-RUNTIME_SO=$(find build -type f -name libsparkinfer_runtime.so -print -quit)
-MOE_SO=$(find build -type f -name libsparkinfer_moe.so -print -quit)
-test -n "$BIN" && test -n "$RUNTIME_SO" && test -n "$MOE_SO"
-cp "$BIN" "$RUNTIME_SO" "$MOE_SO" "$K3_HOME/dist/"
-sha256sum "$K3_HOME/dist"/* | tee "$K3_HOME/dist/SHA256SUMS"
-
-rsync -a "$K3_HOME/dist/" "$RANK1:$K3_HOME/dist/"
-rsync -a "$K3_HOME/dist/" "$RANK2:$K3_HOME/dist/"
-ssh "$RANK1" "cd '$K3_HOME/dist' && sha256sum -c SHA256SUMS"
-ssh "$RANK2" "cd '$K3_HOME/dist' && sha256sum -c SHA256SUMS"
+cp "$(find build -type f -name kimi_k3_dist_generate -print -quit)" \
+   "$(find build -type f -name libsparkinfer_runtime.so -print -quit)" \
+   "$(find build -type f -name libsparkinfer_moe.so -print -quit)" "$K3_HOME/dist/"
 ```
 
-## 3. Launch the measured 12.5 TPS profile
+## 3. One-command TP3 launch (qualified 12.5 TPS profile)
 
-Open all three terminals first. Start rank 0, then immediately start ranks 1 and 2 while
-rank 0 is waiting for workers. The `--spec-draft 8`
-flag is required on **all** ranks because it allocates the rollback ring; rank 0 alone
-chooses drafts. `SPARKINFER_K3_PROJ_TOKS=8`, head banding, and the majority settings
-are load-bearing for the measured structured/repeat-heavy profile.
-
-On rank 0, use `--serve` to keep the model resident and accept API requests:
+Run this on the coordinator. `k3_cluster.sh` copies the runtime distribution to the
+two compute peers, verifies its checksum there, confirms that the local model exists
+on each peer, starts the coordinator first, then starts the peers. It does **not**
+copy weights. The names `coordinator`, `compute-a`, and `compute-b` are operational
+roles; numeric protocol slots are kept inside the helper.
 
 ```bash
 export K3_HOME=$HOME/k3-neuron
-export LD_LIBRARY_PATH="$K3_HOME/dist:${LD_LIBRARY_PATH:-}"
-export SPARKINFER_K3_MOE_WEPS=0 SPARKINFER_K3_GRAPH=0 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0
-export SPARKINFER_K3_DIST_HEAD_BAND=1 SPARKINFER_K3_PROJ_TOKS=8 SPARKINFER_K3_PREFILL_CHUNK=16
-"$K3_HOME/dist/kimi_k3_dist_generate" --rank 0 --world 3 --listen 0.0.0.0:29500 \
-  --model "$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf" --max-ctx 4096 \
-  --serve 127.0.0.1:29600 --spec-draft 8 \
-  --spec-ngram-min 1 --spec-ngram-max 8 --spec-min-occur 2 --spec-majority 2/3
+export COORDINATOR_FABRIC=10.10.10.2
+export PEER_A=youruser@10.10.10.4
+export PEER_B=youruser@10.10.10.6
+export MODEL="$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf"
+cd "$K3_HOME/src/recipe"
+
+# Safe preview first: no SSH, file copy, or process changes.
+bash scripts/k3_cluster.sh dry-run
+
+# Copy runtime only, then launch the measured TP3 K=8/P8 configuration.
+bash scripts/k3_cluster.sh start
+bash scripts/k3_cluster.sh status
 ```
 
-On rank 1:
+Logs and PID files are under `$K3_HOME/run/`; stop only processes started by this
+helper with `bash scripts/k3_cluster.sh stop`. The helper refuses to signal a reused
+PID. Inspect the coordinator log and wait for its local serve listener before sending
+traffic. A first load normally takes about six minutes.
+
+## 4. Experimental TP4 recipes
+
+These recipes use the same `kimi_k3_dist_generate` serve and speculative-decode path,
+with four one-GPU processes. They are code-supported but **not performance-qualified**
+by this release. Start with a short correctness run, retain logs, and benchmark only
+after the gates in [APPLY.md](APPLY.md) pass.
+
+### Four Blackwell hosts (SM120 and/or SM121)
+
+Use four hosts with a reachable private fabric, the same driver/CUDA/NCCL generation,
+the same absolute model path, and a build that includes the required architectures.
+Mixed SM120/SM121 fleets are experimental: validate all four devices and do not mix
+binary or DSO hashes. Each host needs its own local GGUF.
 
 ```bash
 export K3_HOME=$HOME/k3-neuron
-export RANK0=10.10.10.2
-export LD_LIBRARY_PATH="$K3_HOME/dist:${LD_LIBRARY_PATH:-}"
-export SPARKINFER_K3_MOE_WEPS=0 SPARKINFER_K3_GRAPH=0 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0
-export SPARKINFER_K3_DIST_HEAD_BAND=1 SPARKINFER_K3_PROJ_TOKS=8 SPARKINFER_K3_PREFILL_CHUNK=16
-"$K3_HOME/dist/kimi_k3_dist_generate" --rank 1 --world 3 --coord "$RANK0:29500" \
-  --model "$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf" --max-ctx 4096 --spec-draft 8 \
-  --spec-ngram-min 1 --spec-ngram-max 8 --spec-min-occur 2 --spec-majority 2/3
+export TP_SIZE=4
+export COORDINATOR_FABRIC=10.10.10.2
+export PEER_A=youruser@10.10.10.4
+export PEER_B=youruser@10.10.10.6
+export PEER_C=youruser@10.10.10.8
+export MODEL="$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf"
+cd "$K3_HOME/src/recipe"
+bash scripts/k3_cluster.sh dry-run
+bash scripts/k3_cluster.sh start
+bash scripts/k3_cluster.sh status
 ```
 
-On rank 2:
+### One PC with 4× RTX PRO 6000 Blackwell
+
+This is an experimental single-host TP4 layout, intended for **RTX PRO 6000
+Blackwell** GPUs (not RTX 6000 Ada). The machine needs four visible Blackwell GPUs,
+enough local NVMe for the model, and a working NCCL peer-to-peer topology. The helper
+starts four local processes and binds each one to exactly one GPU. It still uses
+`world=4` internally, preserving the TP4 loader and speculative serve path.
 
 ```bash
 export K3_HOME=$HOME/k3-neuron
-export RANK0=10.10.10.2
-export LD_LIBRARY_PATH="$K3_HOME/dist:${LD_LIBRARY_PATH:-}"
-export SPARKINFER_K3_MOE_WEPS=0 SPARKINFER_K3_GRAPH=0 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0
-export SPARKINFER_K3_DIST_HEAD_BAND=1 SPARKINFER_K3_PROJ_TOKS=8 SPARKINFER_K3_PREFILL_CHUNK=16
-"$K3_HOME/dist/kimi_k3_dist_generate" --rank 2 --world 3 --coord "$RANK0:29500" \
-  --model "$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf" --max-ctx 4096 --spec-draft 8 \
-  --spec-ngram-min 1 --spec-ngram-max 8 --spec-min-occur 2 --spec-majority 2/3
+export MODE=local TP_SIZE=4
+export COORDINATOR_FABRIC=127.0.0.1
+export GPU_COORDINATOR=0 GPU_COMPUTE_A=1 GPU_COMPUTE_B=2 GPU_COMPUTE_C=3
+export MODEL="$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf"
+cd "$K3_HOME/src/recipe"
+bash scripts/k3_cluster.sh dry-run
+bash scripts/k3_cluster.sh start
+bash scripts/k3_cluster.sh status
 ```
 
-Wait for rank 0 to report that serve mode is listening. A first load normally takes about
-six minutes; subsequent requests reuse the loaded model.
+For a pure SM120 PC, build with `-DCMAKE_CUDA_ARCHITECTURES=120`. Start at
+`MAX_CTX=4096`, close other GPU workloads, and validate peer access/NCCL before a
+long load. Use `bash scripts/k3_cluster.sh stop` to stop all four helper-owned roles.
 
-## 4. Start the OpenAI-compatible endpoint
+## 5. OpenAI-compatible API for Hermes and other agents
 
-On rank 0, in a second terminal:
+Run this only on the coordinator, after `status` reports the coordinator process
+running. It binds the engine control port to localhost and exposes the HTTP bridge on
+the chosen trusted-network interface.
 
 ```bash
 export K3_HOME=$HOME/k3-neuron
@@ -182,8 +180,6 @@ export K3_API_KEY='replace-with-a-long-random-secret'
 bash api-server/run-api.sh
 ```
 
-Verify the complete path:
-
 ```bash
 curl -fsS http://127.0.0.1:8000/healthz
 curl -fsS http://127.0.0.1:8000/readyz
@@ -194,34 +190,23 @@ curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"kimi-k3-neuron","messages":[{"role":"user","content":"Reply with exactly: SparkInfer is ready."}],"max_tokens":32}'
 ```
 
-Point an OpenAI-compatible agent at `http://RANK0:8000/v1`, use the value of
-`K3_API_KEY`, and select `kimi-k3-neuron`. For example, a Hermes/OpenAI SDK client uses
-`base_url="http://10.10.10.2:8000/v1"`, `api_key=<K3_API_KEY>`, and
-`model="kimi-k3-neuron"`.
+Set an OpenAI-compatible agent’s `base_url` to
+`http://<coordinator-fabric-ip>:8000/v1`, its API key to `K3_API_KEY`, and its model to
+`kimi-k3-neuron`. The bridge is sequential and greedy: it is suitable for a low-QPS
+agent, not a multi-tenant service. Generated tool calls are text, not parsed
+`tool_calls` objects.
 
-## Operational notes
+## Operations and evidence
 
-- Use the speculative profile for recurrence-heavy, structured work. It is not a
-  benchmark promise for open-ended agent prose; removing `--spec-draft` and the
-  speculative environment variables returns ordinary greedy decode.
-- The wrapper accepts `temperature` and `top_p` for client compatibility but currently
-  uses greedy argmax. Requests are serialized; this is a low-QPS agent bridge, not a
-  multi-tenant server.
-- Tool declarations can be included in the prompt template, but generated tool calls are
-  returned as text rather than parsed `tool_calls`. Give the agent a regular textual
-  tool protocol if it needs tool execution today.
-- Keep the three ranks on the same patch/build hashes. Use local NVMe and the fabric IP,
-  not the management gateway, for rank coordination.
+- [APPLY.md](APPLY.md) — exact patch series and required correctness gates.
+- [CURRENT_STATE.md](CURRENT_STATE.md) — present support and release limits.
+- [12.5 TPS receipt](evidence/specdec-k8-p8-12tps-RECEIPT.md) — workload and bracket.
+- [api-server/README.md](api-server/README.md) — adapter behavior.
 
-## More detail
-
-- [APPLY.md](APPLY.md): exact patch series and validation evidence.
-- [api-server/README.md](api-server/README.md): API behavior and response details.
-- [12.5 TPS receipt](evidence/specdec-k8-p8-12tps-RECEIPT.md): workload, bracket, and
-  non-claims.
-- [DETAILS.md](DETAILS.md): architecture and historical investigation material.
+Run `bash scripts/release_check.sh` after cloning the recipe. It verifies checksums,
+patch syntax, and accidental credential material.
 
 ## License
 
-Patches follow the upstream SparkInfer and project license terms. The Kimi-K3 Neuron
+Patches follow the upstream SparkInfer and project license terms. Kimi-K3 Neuron
 weights are distributed separately under their Hugging Face terms.

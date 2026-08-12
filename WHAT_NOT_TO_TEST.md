@@ -13,14 +13,24 @@ This file prevents invalid comparisons and unsafe launch procedures.
 - A different speculative profile as evidence for the K=8/P8 result. In particular,
   `--spec-require-agree` is not part of the qualified 12.55 tok/s configuration.
 - A run with a different quantization, context length, driver/CUDA version, network,
-  rank count, or a mixed binary/DSO deployment as directly comparable.
-- TP4, same-host H200, llama.cpp RPC, H100, or 5090 receipts as three-Spark TP3 results.
+  TP participant count, or a mixed binary/DSO deployment as directly comparable.
+- TP4 (four-host or one-PC), same-host H200, llama.cpp RPC, H100, or 5090 receipts
+  as three-Spark TP3 results.
+- An SM120/SM121 mixed-fleet result as a homogeneous-fleet result, or an RTX 6000 Ada
+  result as an RTX PRO 6000 Blackwell result.
+- Any TP4 run with the TP3 K=8/P8 flags as evidence that TP4 reaches 12.5492 tok/s.
+  TP4 is code-supported and experimental; it has no current public speed claim.
 
 ## Do not use these as a public launcher
 
 - `scripts/spec_draft.sh` and `scripts/spec_rollback.sh`: historical lab helpers with
   hard-coded `/home/victor`, private 10.10.10.x addresses, SSH user, process killing,
   and no deployment validation.
+- Manual copying of a partial `dist/` directory, or manual coordinator/peer starts as
+  the public recipe. Use `scripts/k3_cluster.sh`: it creates and verifies the runtime
+  manifest, copies no GGUF weights, uses role names, and records only its own PIDs.
+- `scripts/k3_cluster.sh stop` against a process not launched by that helper. It
+  deliberately refuses a reused/unrecognized PID rather than killing it.
 - Any `docs/` forecasting or historical investigation document as current operating
   instructions. Start with README, APPLY, and CURRENT_STATE instead.
 - `api-server/` directly on the public Internet. It has optional bearer authentication,
@@ -34,6 +44,9 @@ This file prevents invalid comparisons and unsafe launch procedures.
   near-tied choices.
 - General production or multi-user readiness. The adapter is a trusted-network,
   one-request bridge.
+- That every Blackwell topology has been qualified. The runtime supports SM120/SM121
+  builds and TP4 geometry; driver, NCCL fabric/PCIe topology, available VRAM, and
+  performance still require target-hardware validation.
 - Ownership or redistribution rights for SparkInfer or Kimi-K3 weights. Follow their
   upstream/model-card terms; this repository contains patches and documentation only.
 
@@ -41,7 +54,7 @@ This file prevents invalid comparisons and unsafe launch procedures.
 
 1. `bash scripts/release_check.sh` passes on the clone.
 2. The complete patch chain applies to the pinned base and the required targets build.
-3. Loader, rank-protocol, drafter, tuning/head-band, KDA batch, and rollback checks pass.
-4. Every rank runs the exact same binary and runtime libraries.
-5. Rank-0 logs show the patch-0019 capability probe before performance is reported.
+3. Loader, cluster-protocol, drafter, tuning/head-band, KDA batch, and rollback checks pass.
+4. Every participant runs the exact same binary and runtime libraries.
+5. Coordinator logs show the patch-0019 capability probe before performance is reported.
 6. A real bracketed run uses a rendered chat prompt and preserves raw logs.

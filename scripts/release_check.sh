@@ -9,6 +9,9 @@ fail() { printf 'release_check: %s\n' "$*" >&2; exit 1; }
 command -v sha256sum >/dev/null || fail "sha256sum is required"
 command -v git >/dev/null || fail "git is required"
 
+bash -n scripts/apply_sparkinfer_patch_series.sh scripts/k3_cluster.sh \
+  api-server/run-api.sh scripts/release_check.sh || fail "public shell syntax check failed"
+
 sha256sum -c SHA256SUMS
 (cd patches && sha256sum -c SHA256SUMS)
 

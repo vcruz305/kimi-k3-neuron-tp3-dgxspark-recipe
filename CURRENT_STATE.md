@@ -1,21 +1,39 @@
 # Current release state
 
-Release candidate based on `82abfa9` (`main`), prepared 2026-08-12.
+Release candidate prepared on `main`, 2026-08-12.
 
 This repository publishes a reproducible **three-DGX-Spark TP3 SparkInfer patch
-series** plus an optional, single-request OpenAI-compatible adapter. It does not
-ship model weights, credentials, Spark host configuration, or a hosted service.
+series**, an experimental TP4 path, and an optional, single-request
+OpenAI-compatible adapter. It does not ship model weights, credentials, Spark host
+configuration, or a hosted service.
 
 ## Supported recipe
 
 - Start from the exact SparkInfer base commit in [APPLY.md](APPLY.md).
 - Apply **every patch 0001 through 0026** in the documented order using `git am`.
-- Use all three ranks at the same resulting commit and binary/DSO build.
+- Use all participating machines at the same resulting commit and binary/DSO build.
 - Run the mandatory preflight and correctness gates in `APPLY.md` before serving.
 - The qualified speculative profile is `--spec-draft 8 --spec-ngram-min 1
   --spec-ngram-max 8 --spec-min-occur 2 --spec-majority 2/3` with
   `SPARKINFER_K3_DIST_HEAD_BAND=1` and `SPARKINFER_K3_PROJ_TOKS=8`.
   It is workload-sensitive and off by default.
+- `scripts/k3_cluster.sh` is the public launcher. It calls the machines
+  **coordinator**, **compute-a**, **compute-b**, and optional **compute-c**; it keeps
+  numeric engine slots internal, validates/copies only the runtime distribution, and
+  never copies the model. It supports `dry-run`, `sync`, `start`, `status`, and
+  helper-owned `stop`.
+
+## Experimental TP4
+
+The patched protocol, local loader, and `kimi_k3_dist_generate` accept a four-way
+TP4 `ExpertFfn2D` geometry. The README includes two experimental arrangements:
+four Blackwell hosts (including a carefully validated SM120/SM121 mixed fleet), and
+four RTX PRO 6000 Blackwell GPUs in one PC using one visible GPU per process.
+
+TP4 has historical correctness/performance evidence on four DGX Sparks, but it is
+not a qualified current performance recipe. In particular, K=8/P8's 12.5492 tok/s
+claim belongs only to TP3. Re-run all release gates, topology/NCCL checks, and a
+bracket on the target hardware before making a TP4 claim.
 
 ## Measured result — scope matters
 
@@ -27,7 +45,7 @@ This is a structured-generation result, not a general throughput guarantee.
 The same speculative strategy remained near baseline on freeform prose in qualification.
 Do not quote 12.55 tok/s for arbitrary chat, concurrent use, long context, sampling,
 or a different model/driver/network stack. Re-run the bracket on your own fleet and
-publish the raw rank-0 logs with the result.
+publish the raw coordinator logs with the result.
 
 ## API adapter status
 
