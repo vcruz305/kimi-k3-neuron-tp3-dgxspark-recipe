@@ -52,27 +52,56 @@ Combining the top 5 individually-winning flags (`KDA_FUSE=0 RES_1PASS=0 KDACONV=
 
 ## What not to try again
 
-- **Do not integrate the 7.1 GB DSpark checkpoint merely to clear 10 tok/s.** Patch 0026
-  held structured generation at 10.3002 and 11.3231 tok/s around a matched baseline
-  without another model. Revisit a trained drafter only if the target becomes
-  prose or cross-workload mean >10, which 0026 does not claim.
+- **Do not integrate the old generic/Qwen-derived 7.1 GB DSpark checkpoint merely to clear
+  12 tok/s.** Patch 0026 plus the exact K=8/P8 dispatch
+  held structured generation at 12.5468 and 12.5516 tok/s around a matched baseline
+  without another model. This does **not** reject the K3-native DSpark architecture added
+  by vLLM 0.27: for a 15 tok/s target, first run an offline acceptance probe against the
+  IQ1_S target, then integrate only if that probe clears the memory/acceptance gate.
 - **Do not repeat the legacy span-copy n-gram grid as if it were still the leading path.**
   Recursive `--spec-majority 2/3`, n=[1,8], min-occurrences=2 delivered 95/95 accepted
   drafts. The old `n_min=1` prose regression does not transfer: the majority gate declined
   every prose draft in the measured run.
 - **Do not widen K blindly.** Majority K=5 peaked at 11.9000 on structured repetition but
-  averaged 9.3019; majority K=8 averaged 9.1194. Both accepted every reached draft, so
-  their loss is verification width/cost, not a confidence-gate problem. K=4 remains the
-  bracketed recommendation.
+  averaged 9.3019; generic-dispatch K=8 averaged 9.1194. K=8 became worthwhile only with
+  the exact `SPARKINFER_K3_PROJ_TOKS=8` dispatch: its structured bracket averaged 12.5492
+  but its mixed mean was still 9.7937. K=4 remains the conservative lower-width profile;
+  K=8/P8 is specifically the repeat-heavy structured profile.
+- **Do not lower recursive-majority `min-occurrences` to 1.** The explicit K=7 run averaged
+  8.5134 tok/s and collapsed freeform prose to 4.4760. One historical occurrence is not
+  evidence, even though deeper accepted positions remained accurate.
+- **Do not rerun K=8 without `SPARKINFER_K3_PROJ_TOKS=8`.** Exact-width projection dispatch
+  raised the K=8 mixed mean from 9.1194 to 9.5365 and structured generation to 12.4735;
+  the old K=8 number is no longer the correct comparison arm.
+- **Do not expect power-of-two verifier padding to supply the missing 15 tok/s by itself.**
+  `--spec-pad-pow2` was correct (112/112 accepted) but moved the four-prompt mean only to
+  9.8159 and structured generation to 12.2950. Keep it experimental until it compounds
+  with a separately proven target-side gain.
+- **Do not combine padded K=8 with the old isolated flag winners.** Explicit real-fleet
+  interactions measured: `RES_1PASS=0` 9.6366 mean / 12.3541 structured;
+  `KDACONV=0` 9.7569 / 12.3239; `ADD3=0` 9.8676 / 12.4679. All are regressions or
+  noise-sized ties versus the padded and non-padded controls. The earlier one-token flag
+  sweep does not predict their interaction with batched verification.
 - **Do not stack `KDA_FUSE=0` onto the majority recipe by assumption.** The explicit
   K=4 interaction run averaged 9.2821, no better than the 9.3338 first K=4 candidate.
-- **Do not report the 9.2345 bracketed four-request mean as a three-workload mean, and do
-  not claim prose/general throughput above 10.** Bracketed prose averaged 6.5351 tok/s.
+- **Do not report the 9.2345 K=4 or 9.7937 K=8/P8 four-request means as three-workload
+  means, and do not claim prose/general throughput above 10.** K=8/P8 bracketed prose
+  averaged 6.5893 tok/s; the >12 result is the repeat-heavy structured row only.
 - **Don't bother re-testing individual flags in isolation beyond this list** — all 27 tested flags plus their reasonable value ranges are covered above. Any single-flag win beyond `KDA_FUSE=0` is marginal (≤17%) and none of it is free money waiting to be found by re-running the same sweep.
 - **Don't assume stacking wins.** Proven false above — verify any new combination end-to-end before trusting it.
 - **Don't expect H200-tuned defaults to transfer to GB10 in general.** Most of the flags that helped here were **disabling** something the H200 tuning session had turned on by default (`KDA_FUSE`, `RES_1PASS`, `KDACONV`, `ADD3`, `KDA_IP`, `MOE_BATCH`, `B2WIDE` all measured positive at `=0`, i.e. off). `ROUTER_FAST` is the lone exception where the H200 default still measured correct on GB10.
 - **The numeric-tuning-parameter flags (`RMSG`, `KDA_CPB`, `FUSED4_ROWS`, `PROJ_G`, `WARP_TARGET`) are sensitive to the specific value, not monotonic** — `FUSED4_ROWS=4` beat `=8` by a wide margin; don't assume "more" or "less" is a safe direction to extrapolate without measuring the specific value.
 - **This is not the path to 15 tok/s.** Best case here (even hypothetically stacking, which doesn't actually work) tops out somewhere in the 6.5-7.5 tok/s range. See [`SPECULATIVE-DECODING-DESIGN.md`](SPECULATIVE-DECODING-DESIGN.md) for the actual lever being pursued for that target.
+- **Do not copy vLLM's full KDA CUDA kernel or SM103 low-latency GEMM constants verbatim.**
+  Its fused path is BF16 with a different state/conv layout, and its GEMM table is tuned
+  for SM103 dense BF16. Port the scheduling ideas behind an opt-in f32/SM121 parity gate;
+  keep speculative rollback on the established path until exact state parity is proven.
+- **Do not retry the one-block-per-head f32 KDA state+RMSNorm+gate prototype unchanged.**
+  It passed exact recurrent-state/output parity and engaged on SM121, but its K=8/P8
+  fleet result averaged 9.2972 versus 9.5365 for the control. Structured moved only
+  12.4735→12.5255 while prose fell 5.9814→5.7308 and repeated code fell
+  10.6844→9.3633. The vLLM scheduling idea needs a GB10-specific occupancy redesign,
+  not another run of this shape.
 
 ## Recommended production default (pending further validation)
 

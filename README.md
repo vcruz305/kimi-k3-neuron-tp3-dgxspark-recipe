@@ -22,11 +22,12 @@ Serves the 330 GB Kimi-K3 Neuron IQ1_S GGUF across 3 or 4 NVIDIA DGX Spark (GB10
 > **Historical pre-fix speed tables are invalid** because they were measured on an engine
 > skipping real computation. They are retained only in the detailed historical documents
 > and must not be cited as current results. The corrected engine now has a bracketed,
-> useful structured output past the requested line: in a candidate -> baseline -> candidate
-> bracket, recursive-majority K=4 speculative decoding plus distributed head banding held
-> structured generation at **10.3002 and 11.3231 tok/s (10.8117 average)**. Same-load
-> coherent-code repeats were 10.3358 and 9.9156; prose remained about 6.5. An exploratory
-> K=5 width run peaked at **11.9000 tok/s**, but K=4 remains the bracketed recommendation.
+> useful structured output past the requested line. The conservative K=4 profile held
+> structured generation at **10.3002 and 11.3231 tok/s (10.8117 average)**. The newer
+> repeat-heavy K=8/P8 profile independently held **12.5468 and 12.5516 tok/s (12.5492
+> average)** around a matched 6.4930 baseline, with 112/112 drafts accepted on both sides
+> and identical A/B generated token IDs. This is a structured-output result: its prose
+> control averaged 6.5893 tok/s and its four-request mean was 9.7937 tok/s.
 
 | | |
 |---|---|
@@ -64,9 +65,14 @@ real computation and must not be cited. What is valid now:
   accepted drafts in each candidate run. The two candidate sides averaged **10.8117
   tok/s**, +68.2% over the matched 6.4272 baseline. See
   [Speculative decoding](#speculative-decoding-experimental-opt-in).
-- The new 10+ result is a same-order candidate -> baseline -> candidate bracket. Do not
-  relabel its 9.2345 bracketed four-request mean as a three-workload mean, or claim
-  prose/general TPS above 10.
+- Repeat-heavy structured profile (recursive-majority K=8, exact P8 projection dispatch,
+  distributed head banding): **12.5468 and 12.5516 tok/s**, averaging **12.5492 tok/s**
+  around a matched 6.4930 baseline. Both candidates accepted 112/112 drafts and emitted
+  identical token IDs. The four-request candidate mean was 9.7937 tok/s; prose was 6.5893.
+  See [`evidence/specdec-k8-p8-12tps-RECEIPT.md`](evidence/specdec-k8-p8-12tps-RECEIPT.md).
+- Both structured results use same-order candidate -> baseline -> candidate brackets. Do
+  not relabel the 9.2345 K=4 or 9.7937 K=8/P8 four-request mean as a three-workload mean,
+  or claim prose/general TPS above 10.
 
 Full benchmark tables, decode profile, NCCL fabric receipt, and forecast (**historical,
 pre-fix, clearly marked as such**): [`DETAILS.md`](DETAILS.md#benchmarks-measured-on-real-sparks).
@@ -144,6 +150,24 @@ did not displace K=4. Full logs,
 hashes, methodology, and non-claims are in
 [`evidence/specdec-majority-10tps-RECEIPT.md`](evidence/specdec-majority-10tps-RECEIPT.md).
 
+The exact-width K=8/P8 follow-up changes the structured recommendation for repeat-heavy
+output without changing the patch chain:
+
+| K=8/P8 workload | candidate A | baseline | candidate B | candidate avg |
+|---|---:|---:|---:|---:|
+| coherent code | 9.3535 | 6.4746 | 8.6543 | 9.0039 |
+| structured generation | **12.5468** | 6.4930 | **12.5516** | **12.5492** |
+| freeform prose | 6.6040 | 6.4626 | 6.5746 | 6.5893 |
+| coherent code, same-load repeat | 11.2682 | 6.4705 | 10.7961 | 11.0322 |
+| four-request mean | 9.9431 | 6.4752 | 9.6442 | 9.7937 |
+
+It uses `--spec-draft 8 --spec-ngram-min 1 --spec-ngram-max 8 --spec-min-occur 2
+--spec-majority 2/3`, `SPARKINFER_K3_DIST_HEAD_BAND=1`, and critically
+`SPARKINFER_K3_PROJ_TOKS=8`. Both candidates accepted **112/112** drafts and generated
+identical token IDs on all prompts. This is a structured/repeat-heavy profile, not a
+general or prose >12 tok/s claim. Full receipt:
+[`evidence/specdec-k8-p8-12tps-RECEIPT.md`](evidence/specdec-k8-p8-12tps-RECEIPT.md).
+
 **Correctness**: verified against the same standard the rest of this engine is held to —
 not necessarily byte-identical to non-speculative decoding (a documented, understood
 NCCL-reduction-order effect makes that unreachable without a larger collective-comms
@@ -165,9 +189,11 @@ fresh binary fails silently). Patch `0024` bumps the internal rank-to-rank proto
 version, so **all ranks must run the same patch level** — a mismatched rank fails loudly
 at startup ("unsupported protocol version") rather than silently desyncing.
 
-Add `--spec-draft K` to rank 0's launch command (K in `[2,16]`; `4` is the measured-best
-value. Majority K=5 and K=8 also measured worse overall than K=4, so don't assume bigger
-is better). The current 10+ command uses `--spec-ngram-min 1 --spec-ngram-max 8
+Add `--spec-draft K` to rank 0's launch command (K in `[2,16]`; `4` remains the
+lower-width conservative profile, while `8` with the exact P8 projection dispatch is the
+measured repeat-heavy structured profile). Bigger is not automatically better: the P8
+dispatch setting is load-bearing for the K=8 result. The recursive-majority command uses
+`--spec-ngram-min 1 --spec-ngram-max 8
 --spec-min-occur 2 --spec-majority 2/3` and the environment variable
 `SPARKINFER_K3_DIST_HEAD_BAND=1`:
 
@@ -195,6 +221,11 @@ and refuses to start otherwise). `--spec-ngram-min`/`--spec-ngram-max` are rank0
 The old warning that `n_min=1` hurt prose applies to legacy span copying; 0026's 2/3
 majority gate declined every prose draft in the measured run. `--spec-majority` is opt-in,
 so omitting it preserves 0025 behavior byte for byte.
+
+For the measured K=8/P8 structured profile, use the same launch on every rank with
+`--spec-draft 8`, set `SPARKINFER_K3_PROJ_TOKS=8`, and keep
+`SPARKINFER_K3_DIST_HEAD_BAND=1`. Do not add `--spec-pad-pow2`; padding was a separate
+experiment and was off in the bracketed 12.5492 tok/s result.
 
 With `--spec-draft` omitted (the default), behavior and performance are **unchanged**
 from before these patches — every existing benchmark and result elsewhere in this repo
