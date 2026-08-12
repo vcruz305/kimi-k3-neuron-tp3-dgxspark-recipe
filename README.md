@@ -48,12 +48,24 @@ in [`DETAILS.md`](DETAILS.md#related-vllm-path).
 
 ## Speed
 
-| | Median decode | Load time (per rank) |
-|---|---:|---:|
-| 3× Spark (TP3) | **6.84 tok/s** | **~5m45s** (was ~30–60 min pre-patch 0013) |
-| 4× Spark (TP4) | **7.945 tok/s** | ~5m45s |
+**⚠️ No current, valid headline decode number.** The pre-fix table this section used to
+show (6.84 / 7.945 tok/s) was measured on an engine that skipped real computation (see
+the correctness banner above) and has been removed rather than left in a table someone
+might screenshot out of context. What's real and current instead:
 
-Full benchmark tables, decode profile, NCCL fabric receipt, and forecast: [`DETAILS.md`](DETAILS.md#benchmarks-measured-on-real-sparks).
+- Load time: **~5m45s/rank** (was ~30-60 min pre-patch 0013) — this number is unaffected
+  by the correctness fix and still valid.
+- Best single kernel-tuning win on the corrected engine: `SPARKINFER_K3_KDA_FUSE=0`,
+  **+20%** over its own (not-yet-headline) baseline — see
+  [`docs/TP3-KERNEL-FLAG-SWEEP.md`](docs/TP3-KERNEL-FLAG-SWEEP.md).
+- With speculative decoding (`--spec-draft 4`): **+34.5% mean**, but workload-dependent
+  — see the [Speculative decoding](#speculative-decoding-experimental-opt-in) section
+  below for the real, per-workload numbers.
+- A proper multi-prompt-median baseline on the corrected engine (the rigorous
+  measurement protocol this repo otherwise uses for headline numbers) is still pending.
+
+Full benchmark tables, decode profile, NCCL fabric receipt, and forecast (**historical,
+pre-fix, clearly marked as such**): [`DETAILS.md`](DETAILS.md#benchmarks-measured-on-real-sparks).
 
 ## Quick start
 
@@ -120,21 +132,29 @@ at startup ("unsupported protocol version") rather than silently desyncing.
 Add `--spec-draft K` to rank 0's launch command (K in `[2,16]`; `4` is the measured-best
 value — `8` measured *worse* than `4`, don't assume bigger is better):
 
+**`--spec-draft K` is required on every rank, not just rank 0.** The n-gram matching
+decision is rank0-only, but `--spec-draft K` also arms each rank's local state-rollback
+ring — a worker launched without it has no ring to roll back into, and will error out
+the first time rank0 sends a rollback instruction (`kimi_k3_dist_forward_rollback`
+fails with "was kimi_k3_dist_set_rollback called before the batch?"). All ranks need the
+**same** K value.
+
 ```bash
 # rank 0
 SPARKINFER_K3_PREFILL_CHUNK=64 ./kimi_k3_dist_generate --rank 0 --world 3 \
   --listen 0.0.0.0:29500 --model .../k3-neuron-iq1s-00001-of-00009.gguf \
   --prompt-ids <...> --n-predict <N> --max-ctx 4096 --spec-draft 4
 
-# ranks 1, 2 — unchanged, no new flags needed
-./kimi_k3_dist_generate --rank {1|2} --world 3 --coord HOST:29500 \
-  --model ... --max-ctx 4096
+# ranks 1, 2 — SAME --spec-draft K (required to arm rollback), rest unchanged
+SPARKINFER_K3_PREFILL_CHUNK=64 ./kimi_k3_dist_generate --rank {1|2} --world 3 \
+  --coord HOST:29500 --model ... --max-ctx 4096 --spec-draft 4
 ```
 
-`SPARKINFER_K3_PREFILL_CHUNK` must be `>= K` (the flag validates this and refuses to
-start otherwise). Optionally tune the n-gram match window with `--spec-ngram-min N`
-(default `2` — `1` cost freeform prose 12.5%, measured; `3` under-fires and drafts on
-only ~16% of steps).
+`SPARKINFER_K3_PREFILL_CHUNK` must be `>= K` **on every rank** (the flag validates this
+and refuses to start otherwise). `--spec-ngram-min`/`--spec-ngram-max` (the n-gram match
+window, default `2`-`3` — `n_min=1` cost freeform prose 12.5%, measured; `n_min=3`
+under-fires and drafts on only ~16% of steps) are rank0-only and don't need to match on
+workers, but there's no harm in passing them everywhere for consistency.
 
 With `--spec-draft` omitted (the default), behavior and performance are **unchanged**
 from before these patches — every existing benchmark and result elsewhere in this repo

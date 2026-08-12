@@ -1,5 +1,12 @@
 # Three-Spark TP3 recipe (Kimi-K3 Neuron IQ1_S)
 
+> **⚠️ Superseded — historical, kept for reference only.** This describes the project's
+> early bring-up state, before correctness was verified, before speed tuning, and before
+> speculative decoding. It is no longer accurate: multi-Spark generation is not
+> incomplete, it works, and the geometry/topology below is still a useful reference but
+> the "Proven vs Missing" table is out of date. **Use [`README.md`](README.md) and
+> [`APPLY.md`](APPLY.md) for the current, maintained recipe.**
+
 **Preview bring-up recipe.** Full-model multi-Spark generation is incomplete.
 Use this to align geometry, collectives, and agent ops — not to promise production tok/s.
 

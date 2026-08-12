@@ -1,35 +1,26 @@
 # How to hand this to a Spark-controlling LLM agent
 
-## Minimal prompt (copy-paste)
+> **This file is superseded.** It predates the working recipe (correctness fix, speed
+> tuning, and speculative decoding all landed after this was written) and used to point
+> at `SPARK-AGENT.md` / `THREE-SPARK-TP3-RECIPE.md`, which describe an early,
+> incomplete "preview bring-up" state that no longer reflects reality — see the
+> deprecation notices on those files. **Use [`README.md`](README.md)'s own "Give this to
+> your agent" section instead**, which is the maintained, current onboarding path and is
+> kept in sync with the actual state of the recipe. This file is kept for history, not
+> as instructions.
 
-```text
-You control my NVIDIA DGX Spark fleet for development.
+## What to use instead
 
-Clone and read this repository first:
-  https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe
+Copy the prompt from README.md's [Give this to your agent](README.md#give-this-to-your-agent)
+section (base recipe) and, once that's working, the
+[speculative decoding follow-up prompt](README.md#speculative-decoding-experimental-opt-in)
+if you want that too. Both are kept accurate as the recipe changes; this file is not.
 
-Mandatory:
-  1. Open SPARK-AGENT.md and follow it as your operating contract.
-  2. Open THREE-SPARK-TP3-RECIPE.md for geometry and ladder.
-  3. Do not claim multi-Spark production inference is ready.
-  4. Run scripts/gpu_health_gate.py on every Spark before long work.
-  5. Never put API tokens or SSH keys in chat or commits.
+## Still true, kept for reference
 
-Current task:
-  <PASTE TASK — e.g. "Run 3-rank NCCL microbench on sparks A/B/C and file a receipt">
-```
-
-## Recommended agent defaults
-
-- Working tree: clone of this repo + separate SparkInfer checkout for `git am`.
-- Model weights: local path to gated HF download (not in git).
-- Secrets: environment only.
-- Deliverable: receipt markdown under `evidence/live-YYYYMMDD/` with hostnames, commands, hashes.
-
-## Pairing with sparkfleet
-
-If you also use `vcruz305/sparkfleet` for lifecycle/updates:
-
-1. Use **sparkfleet** for OS/firmware/driver fleet ops.  
-2. Use **this repo** for K3 Neuron TP3 bring-up only.  
-3. Do not mix update windows with full-model TP experiments on the same nodes.
+- Never put API tokens or SSH keys in chat or commits.
+- `scripts/gpu_health_gate.py` is still a reasonable pre-flight check before long work
+  on a Spark, if you want it — not required by the current recipe.
+- If you also use `vcruz305/sparkfleet` for OS/firmware/driver lifecycle: use
+  **sparkfleet** for fleet ops, this repo for K3 Neuron TP3 serving only, and don't mix
+  update windows with full-model experiments on the same nodes.

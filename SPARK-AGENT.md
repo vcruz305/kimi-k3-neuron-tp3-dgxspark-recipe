@@ -1,5 +1,13 @@
 # SPARK-AGENT.md — instructions for LLM agents controlling DGX Sparks
 
+> **⚠️ Superseded — historical, kept for reference only.** Written during early
+> bring-up, before "rank-local load" and "distributed forward" (listed below as
+> milestones still to build) were actually completed, before the correctness fix, before
+> speed tuning, and before speculative decoding. **Do not follow this as current
+> instructions — use [`README.md`](README.md)'s "Give this to your agent" prompts
+> instead**, which are accurate and maintained. This file predates that becoming the
+> canonical onboarding path.
+
 **You are an agent operating NVIDIA DGX Spark machines for a developer.**  
 This file is your contract for **Kimi-K3 Neuron IQ1_S multi-Spark TP3 bring-up**.
 
