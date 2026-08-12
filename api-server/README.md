@@ -114,9 +114,11 @@ a `tools` declaration, both independently and via `apply_chat_template`.
 
 ### 1. SparkInfer with the verified patch chain
 
-Follow `APPLY.md`'s complete 27-patch chain through 0025. Patch 0014 introduces
-`--serve`; patches 0021–0025 are merged with it and were verified in a real two-request
-serve test. Build `kimi_k3_dist_generate` normally and copy the same binary + `.so`s to
+Follow `APPLY.md`'s complete 28-patch chain through 0026. Patch 0014 introduces
+`--serve`; patches 0021–0026 are merged with it. The serve/protocol path through 0025
+was verified in a real two-request serve test; 0026 uses the shared drafter loop and was
+built and TP3-benchmarked, but did not repeat that HTTP test. Build
+`kimi_k3_dist_generate` normally and copy the same binary + `.so`s to
 every rank (see `APPLY.md` / `DETAILS.md`).
 
 ### 2. Python wrapper
@@ -199,8 +201,8 @@ non-standard `reasoning_content` delta field when `"thinking": true` is set).
 ## Status
 
 **Current status: working and verified on the real 3-Spark fleet.** The complete chain
-through 0025 applies cleanly from the pinned base. The merged serve + speculative-decoding
-path was rebuilt on GB10 and exercised with two sequential requests: request 1 streamed
+through 0026 applies cleanly from the pinned base. The merged serve + speculative-decoding
+path through 0025 was rebuilt on GB10 and exercised with two sequential requests: request 1 streamed
 16 tokens, request 2 forced the distributed KV/KDA reset and returned 16 tokens, then all
 ranks shut down cleanly. Both client and driver checks passed.
 
@@ -310,4 +312,4 @@ discussion and whatever comes out of it.
 That investigation also exposed an uncaptured multi-prompt/KV-reset dependency between
 0013 and 0014. It is now patch 0015, including the protocol-side `-2` reset-sentinel
 allowances. The complete series no longer needs a dirty-tree `git apply` workaround;
-the documented 27-patch order succeeds with plain `git am`.
+the documented 28-patch order succeeds with plain `git am`.

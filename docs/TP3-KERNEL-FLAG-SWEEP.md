@@ -52,6 +52,22 @@ Combining the top 5 individually-winning flags (`KDA_FUSE=0 RES_1PASS=0 KDACONV=
 
 ## What not to try again
 
+- **Do not integrate the 7.1 GB DSpark checkpoint merely to clear 10 tok/s.** Patch 0026
+  held structured generation at 10.3002 and 11.3231 tok/s around a matched baseline
+  without another model. Revisit a trained drafter only if the target becomes
+  prose or cross-workload mean >10, which 0026 does not claim.
+- **Do not repeat the legacy span-copy n-gram grid as if it were still the leading path.**
+  Recursive `--spec-majority 2/3`, n=[1,8], min-occurrences=2 delivered 95/95 accepted
+  drafts. The old `n_min=1` prose regression does not transfer: the majority gate declined
+  every prose draft in the measured run.
+- **Do not widen K blindly.** Majority K=5 peaked at 11.9000 on structured repetition but
+  averaged 9.3019; majority K=8 averaged 9.1194. Both accepted every reached draft, so
+  their loss is verification width/cost, not a confidence-gate problem. K=4 remains the
+  bracketed recommendation.
+- **Do not stack `KDA_FUSE=0` onto the majority recipe by assumption.** The explicit
+  K=4 interaction run averaged 9.2821, no better than the 9.3338 first K=4 candidate.
+- **Do not report the 9.2345 bracketed four-request mean as a three-workload mean, and do
+  not claim prose/general throughput above 10.** Bracketed prose averaged 6.5351 tok/s.
 - **Don't bother re-testing individual flags in isolation beyond this list** — all 27 tested flags plus their reasonable value ranges are covered above. Any single-flag win beyond `KDA_FUSE=0` is marginal (≤17%) and none of it is free money waiting to be found by re-running the same sweep.
 - **Don't assume stacking wins.** Proven false above — verify any new combination end-to-end before trusting it.
 - **Don't expect H200-tuned defaults to transfer to GB10 in general.** Most of the flags that helped here were **disabling** something the H200 tuning session had turned on by default (`KDA_FUSE`, `RES_1PASS`, `KDACONV`, `ADD3`, `KDA_IP`, `MOE_BATCH`, `B2WIDE` all measured positive at `=0`, i.e. off). `ROUTER_FAST` is the lone exception where the H200 default still measured correct on GB10.

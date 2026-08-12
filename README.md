@@ -22,16 +22,17 @@ Serves the 330 GB Kimi-K3 Neuron IQ1_S GGUF across 3 or 4 NVIDIA DGX Spark (GB10
 > **Historical pre-fix speed tables are invalid** because they were measured on an engine
 > skipping real computation. They are retained only in the detailed historical documents
 > and must not be cited as current results. The corrected engine now has a bracketed,
-> three-workload measurement: **8.5447 tok/s mean** for confidence-gated K=4 speculative
-> decoding plus distributed head banding, **+40.61%** over its average bracketing baseline.
-> A repeated multi-prompt-median headline is still pending; see [Speed](#speed) for the
-> exact scope and caveats of the current measurement.
+> useful structured output past the requested line: in a candidate -> baseline -> candidate
+> bracket, recursive-majority K=4 speculative decoding plus distributed head banding held
+> structured generation at **10.3002 and 11.3231 tok/s (10.8117 average)**. Same-load
+> coherent-code repeats were 10.3358 and 9.9156; prose remained about 6.5. An exploratory
+> K=5 width run peaked at **11.9000 tok/s**, but K=4 remains the bracketed recommendation.
 
 | | |
 |---|---|
 | **This recipe** | [`github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe`](https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe) |
 | **Model (GGUF)** | [`huggingface.co/vcruz305/Kimi-K3-Neuron-IQ1S-GGUF`](https://huggingface.co/vcruz305/Kimi-K3-Neuron-IQ1S-GGUF) (~330 GB) |
-| Patches | Complete 27-patch chain through `0025` verified via fresh-clone `git am`, fleet build, equivalence tests, benchmark, and serve integration — see [`APPLY.md`](APPLY.md#series-status--what-actually-applies) |
+| Patches | Complete 28-patch chain through `0026`; 0026 clean-applied, built, correctness-gated, and fleet-benchmarked on top of the audited prior chain — see [`APPLY.md`](APPLY.md#series-status--what-actually-applies) |
 | Full data | benchmarks, geometry, run steps, non-claims → [`DETAILS.md`](DETAILS.md) |
 
 ## Why SparkInfer
@@ -58,13 +59,14 @@ real computation and must not be cited. What is valid now:
 - Best single kernel-tuning win on the corrected engine: `SPARKINFER_K3_KDA_FUSE=0`,
   **+20%** over its own (not-yet-headline) baseline — see
   [`docs/TP3-KERNEL-FLAG-SWEEP.md`](docs/TP3-KERNEL-FLAG-SWEEP.md).
-- Current measured candidate (confidence-gated K=4 speculative decoding + distributed head
-  banding): **8.5447 tok/s mean, +40.61%** over the average of bracketing corrected
-  baselines. Prose is now +8.07% rather than regressing. See
+- Current bracketed candidate (recursive-majority K=4 speculative decoding + distributed
+  head banding): **10.3002 and 11.3231 tok/s on structured generation**, with 95/95
+  accepted drafts in each candidate run. The two candidate sides averaged **10.8117
+  tok/s**, +68.2% over the matched 6.4272 baseline. See
   [Speculative decoding](#speculative-decoding-experimental-opt-in).
-- This is a five-run, three-workload, same-session bracketed comparison, not the repo's
-  older repeated multi-prompt-median headline protocol. That stricter headline remains
-  pending; do not relabel 8.5447 as a fleet-wide median.
+- The new 10+ result is a same-order candidate -> baseline -> candidate bracket. Do not
+  relabel its 9.2345 bracketed four-request mean as a three-workload mean, or claim
+  prose/general TPS above 10.
 
 Full benchmark tables, decode profile, NCCL fabric receipt, and forecast (**historical,
 pre-fix, clearly marked as such**): [`DETAILS.md`](DETAILS.md#benchmarks-measured-on-real-sparks).
@@ -72,7 +74,7 @@ pre-fix, clearly marked as such**): [`DETAILS.md`](DETAILS.md#benchmarks-measure
 ## Quick start
 
 1. 3 or 4 Sparks, local NVMe (≥320 GB free/node), HF access to the gated model.
-2. Pull the model + apply the verified patch chain through 0025 — see [`APPLY.md`](APPLY.md).
+2. Pull the model + apply the verified patch chain through 0026 — see [`APPLY.md`](APPLY.md).
 3. Copy the built `dist/` tree to every rank, launch rank 0 with `--listen`, others with `--coord`.
 
 Full step-by-step (model download, build flags, topology, multi-prompt launch): [`DETAILS.md`](DETAILS.md#full-run-steps).
@@ -82,14 +84,15 @@ Full step-by-step (model download, build flags, topology, multi-prompt launch): 
 [`api-server/`](api-server/README.md) wraps `kimi_k3_dist_generate` with a
 `POST /v1/chat/completions` HTTP server (chat-template tokenization, a rank0
 `--serve` mode so the model stays resident between requests, streaming SSE
-support). Serve mode is introduced by patch 0014 and is verified together with the
-complete speculative-decoding chain through 0025. See `api-server/README.md` for build/run steps and known
+support). Serve mode is introduced by patch 0014 and was integration-tested through
+0025; 0026 uses the same shared drafter/decode loop and was built and fleet-benchmarked,
+but did not repeat the two-request HTTP test. See `api-server/README.md` for build/run steps and known
 limitations (greedy decoding only, one request in flight at a time).
 
 ## Speculative decoding (experimental, opt-in)
 
-Patches `0021`–`0025` add n-gram/prompt-lookup speculative decoding, match-confidence
-gating, and distributed LM-head banding to the distributed
+Patches `0021`–`0026` add n-gram/prompt-lookup speculative decoding, match-confidence
+gating, recursive-majority continuation, and distributed LM-head banding to the distributed
 path: rank0 looks for the current token sequence's most recent earlier occurrence in the
 generation history, drafts the tokens that followed it, and verifies the whole draft in
 one batched forward pass instead of one token at a time. No second model, no training —
@@ -119,6 +122,28 @@ The average bracketing baseline is 6.07705 tok/s. Prose is now +8.07% rather tha
 regressing. Draft acceptance was 59/64 = 0.9219. Head banding was independently proven
 bitwise-equivalent on 129/129 dumped logit rows.
 
+Patch 0026 replaces brittle single-span copying, when explicitly enabled, with a
+left-to-right recursive majority: at each draft position it selects the highest-order
+history whose continuation has at least a 2/3 vote, appends that proposal to a temporary
+history, then predicts the next position. On the real TP3 fleet:
+
+| 0026 workload | candidate A | baseline | candidate B | candidate avg |
+|---|---:|---:|---:|---:|
+| coherent code | **10.0983** | 6.3621 | 8.8326 | 9.4655 |
+| structured generation | **10.3002** | 6.4272 | **11.3231** | **10.8117** |
+| freeform prose | 6.6009 | 6.4905 | 6.4693 | 6.5351 |
+| coherent code, same-load repeat | **10.3358** | 6.4162 | 9.9156 | **10.1257** |
+| four-request mean | 9.3338 | 6.4240 | 9.1352 | 9.2345 |
+
+The run used `--spec-draft 4 --spec-ngram-min 1 --spec-ngram-max 8
+--spec-min-occur 2 --spec-majority 2/3` and `SPARKINFER_K3_DIST_HEAD_BAND=1`.
+Each candidate accepted **95/95 proposed tokens** and finished clean. The sustained 10+
+claim applies to the structured-generation row, not prose or the cross-workload mean.
+An exploratory K=5 run reached 11.9000 tok/s on that row, but its 9.3019 overall mean
+did not displace K=4. Full logs,
+hashes, methodology, and non-claims are in
+[`evidence/specdec-majority-10tps-RECEIPT.md`](evidence/specdec-majority-10tps-RECEIPT.md).
+
 **Correctness**: verified against the same standard the rest of this engine is held to —
 not necessarily byte-identical to non-speculative decoding (a documented, understood
 NCCL-reduction-order effect makes that unreachable without a larger collective-comms
@@ -130,10 +155,10 @@ throughout. Backed by 1000+ automated correctness checks (see the patch series b
 
 ### Usage
 
-Apply patches `0021`→`0022`→`0023`→`0024`→`0025` in order on top of `0020`
-(each depends on the one before it touching the same files). The complete 27-patch
-chain was verified from the pinned base via plain `git am`, built on GB10, and
-matched the tested fleet tree byte-for-byte. Rebuild `kimi_k3_dist_generate` and
+Apply patches `0021`→`0022`→`0023`→`0024`→`0025`→`0026` in order on top of `0020`
+(each depends on the one before it touching the same files). The chain through 0025 was
+fresh-clone audited; 0026 plain-`git am` applied to that clean tip, built on GB10, and
+matched the tested generator source. Rebuild `kimi_k3_dist_generate` and
 `libsparkinfer_runtime.so` and redeploy both to every rank (same sha256sum discipline as
 the base recipe — **do not skip verifying the `.so`**, a stale runtime library behind a
 fresh binary fails silently). Patch `0024` bumps the internal rank-to-rank protocol
@@ -141,9 +166,9 @@ version, so **all ranks must run the same patch level** — a mismatched rank fa
 at startup ("unsupported protocol version") rather than silently desyncing.
 
 Add `--spec-draft K` to rank 0's launch command (K in `[2,16]`; `4` is the measured-best
-value — `8` measured *worse* than `4`, don't assume bigger is better). The current
-measured command also uses `--spec-ngram-min 2 --spec-ngram-max 3
---spec-min-occur 2 --spec-require-agree` and the environment variable
+value. Majority K=5 and K=8 also measured worse overall than K=4, so don't assume bigger
+is better). The current 10+ command uses `--spec-ngram-min 1 --spec-ngram-max 8
+--spec-min-occur 2 --spec-majority 2/3` and the environment variable
 `SPARKINFER_K3_DIST_HEAD_BAND=1`:
 
 **`--spec-draft K` is required on every rank, not just rank 0.** The n-gram matching
@@ -157,7 +182,8 @@ fails with "was kimi_k3_dist_set_rollback called before the batch?"). All ranks 
 # rank 0
 SPARKINFER_K3_PREFILL_CHUNK=64 ./kimi_k3_dist_generate --rank 0 --world 3 \
   --listen 0.0.0.0:29500 --model .../k3-neuron-iq1s-00001-of-00009.gguf \
-  --prompt-ids <...> --n-predict <N> --max-ctx 4096 --spec-draft 4
+  --prompt-ids <...> --n-predict <N> --max-ctx 4096 --spec-draft 4 \
+  --spec-ngram-min 1 --spec-ngram-max 8 --spec-min-occur 2 --spec-majority 2/3
 
 # ranks 1, 2 — SAME --spec-draft K (required to arm rollback), rest unchanged
 SPARKINFER_K3_PREFILL_CHUNK=64 ./kimi_k3_dist_generate --rank {1|2} --world 3 \
@@ -165,10 +191,10 @@ SPARKINFER_K3_PREFILL_CHUNK=64 ./kimi_k3_dist_generate --rank {1|2} --world 3 \
 ```
 
 `SPARKINFER_K3_PREFILL_CHUNK` must be `>= K` **on every rank** (the flag validates this
-and refuses to start otherwise). `--spec-ngram-min`/`--spec-ngram-max` (the n-gram match
-window, default `2`-`3` — `n_min=1` cost freeform prose 12.5%, measured; `n_min=3`
-under-fires and drafts on only ~16% of steps) are rank0-only and don't need to match on
-workers, but there's no harm in passing them everywhere for consistency.
+and refuses to start otherwise). `--spec-ngram-min`/`--spec-ngram-max` are rank0-only.
+The old warning that `n_min=1` hurt prose applies to legacy span copying; 0026's 2/3
+majority gate declined every prose draft in the measured run. `--spec-majority` is opt-in,
+so omitting it preserves 0025 behavior byte for byte.
 
 With `--spec-draft` omitted (the default), behavior and performance are **unchanged**
 from before these patches — every existing benchmark and result elsewhere in this repo
@@ -186,8 +212,8 @@ Paste this into an AI coding agent (Claude Code, etc.) with SSH access to your S
 Set up Kimi-K3 Neuron serving across my DGX Spark fleet using this recipe:
 https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe
 
-1. Read APPLY.md in that repo and apply its complete verified 27-patch chain through
-   0025 on top of the pinned gittensor-ai-lab/sparkinfer-k3 base commit. Use the exact
+1. Read APPLY.md in that repo and apply its complete verified 28-patch chain through
+   0026 on top of the pinned gittensor-ai-lab/sparkinfer-k3 base commit. Use the exact
    listed order, then build kimi_k3_dist_generate and the documented runtime libraries.
 2. Read DETAILS.md's "Full run steps" section for the model download command,
    required dist/ files, topology, and launch commands. Follow it exactly —
@@ -217,7 +243,7 @@ https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe
    design (rank0 --serve mode instead of the static --prompts-file path,
    llama.cpp's own vocab for tokenization) and why the wrapper is shaped the
    way it is. Don't improvise around it.
-2. Follow APPLY.md's complete chain through 0025. Patch 0014 introduces serve mode and
+2. Follow APPLY.md's complete chain through 0026. Patch 0014 introduces serve mode and
    is already included; do not apply it twice if the full chain is present. Rebuild
    kimi_k3_dist_generate and the runtime libraries, then redeploy the same verified
    dist/ contents to every rank.

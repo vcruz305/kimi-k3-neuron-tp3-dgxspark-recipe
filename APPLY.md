@@ -1,7 +1,7 @@
 # APPLY.md — SparkInfer K3 multi-Spark patch chain
 
 **Base:** `7a9b77a043596157d74e4af376cf9f29f68ce368`  
-**Tip:** `main` — **git am 0001–0025** (27 patches including 0015/0018a/0019a)
+**Tip:** `main` — **git am 0001–0026** (28 patches including 0015/0018a/0019a)
 
 > **If you apply only one patch, make it 0019.** Everything before it runs an
 > engine that silently skips the shared experts, the routed norm and the MLA
@@ -44,7 +44,8 @@ for p in \
   /tmp/k3-recipe/patches/sparkinfer/next/0022-tp-specdec-ar-count-determinism-diagnostic.diff \
   /tmp/k3-recipe/patches/sparkinfer/next/0023-tp-specdec-stage3-kda-state-rollback.diff \
   /tmp/k3-recipe/patches/sparkinfer/next/0024-tp-specdec-stage4-ngram-drafter-and-ktoken-protocol.diff \
-  /tmp/k3-recipe/patches/sparkinfer/next/0025-tp-specdec-tuning-confidence-gate-and-dist-head-band.diff
+  /tmp/k3-recipe/patches/sparkinfer/next/0025-tp-specdec-tuning-confidence-gate-and-dist-head-band.diff \
+  /tmp/k3-recipe/patches/sparkinfer/next/0026-tp-specdec-recursive-majority-drafter.diff
 do git am "$p"; done
 
 cmake -S runtime -B build -DSPARKINFER_TP=ON
@@ -60,10 +61,10 @@ A clean-room audit (fresh clone of the pinned base, `git am` in order, nothing
 reused from a working tree) established the following. Run it yourself before
 trusting any of it.
 
-**Verified applying cleanly: the complete 27-patch chain through 0025.** A fresh
-checkout of the pinned upstream base accepted every patch via plain `git am`, with
-zero dirty files, and the resulting tree was byte-identical to the tree built on the
-fleet. This closes both earlier gaps:
+**Verified applying cleanly: the complete 28-patch chain through 0026.** The chain
+through 0025 was fresh-clone audited with zero dirty files and a byte-identical fleet
+tree. Patch 0026 was then plain-`git am` applied to that exact clean tip, built on GB10,
+correctness-gated, and fleet-benchmarked.
 
 1. 0015 now includes the two protocol-side allowances for the `-2` distributed
    KV-reset sentinel. Without them 0024 could not apply and workers would reject a
@@ -77,7 +78,7 @@ fleet. This closes both earlier gaps:
    measured best case.
 
 The merged fleet build completed with CUDA architecture 121 and passed: loader
-38/38, rank protocol 17/17, drafter/oracle 1089/1089, tuning/head-band 29/29,
+38/38, rank protocol 17/17, drafter/oracle **1091/1091**, tuning/head-band 29/29,
 KDA head-shard relL2 9.956e-08, MoE width-shard relL2 1.135e-07, and batched KDA
 bit-identical for K=2..8. An end-to-end `--serve` + protocol-v2 test sent two
 requests (streaming first, distributed KV reset before the second) and shut down
@@ -116,6 +117,7 @@ against the working tree.
 | 0023 | Stage 3 — KDA recurrent-state rollback (a history ring on 0021's arenas), so a rejected speculative draft can be cleanly unwound. Requires 0021 (shares `kimi_k3_dist_forward.cpp`/`kimi_k3.cpp` hunks) |
 | **0024** | **speculative decoding Stage 4 — the actual n-gram drafter, accept/reject loop, and rank-protocol v2 (carries a whole verify batch + deferred rollback per step). USER-FACING: `--spec-draft K`. Requires 0021+0023 (shares `kimi_k3_dist_forward.cpp`, `kimi_k3_dist_generate.cpp`, `rank_protocol.h`)** |
 | **0025** | **match-confidence gating plus distributed LM-head banding. `--spec-min-occur 2 --spec-require-agree` filters false-positive n-grams; `SPARKINFER_K3_DIST_HEAD_BAND=1` gives each rank an uneven vocab band (54614/54613/54613 for TP3), zero-fills the rest, then reuses all-reduce. 129/129 dumped logits were bitwise identical to the unbanded path. Combined measured 8.5447 tok/s, +40.61% over the average of bracketing baselines** |
+| **0026** | **opt-in recursive-majority continuation: `--spec-majority 2/3` re-predicts each draft position from the highest-order recurring tail with a two-thirds continuation vote instead of copying one stale span. Real TP3 candidate -> baseline -> candidate bracket: structured generation 10.3002 / 6.4272 / 11.3231 tok/s (candidate average 10.8117, +68.2%); 95/95 drafts accepted on both candidate sides. Default remains off, preserving 0025 behavior** |
 
 ### 0011
 - `finish()` no longer holds `mu_` while waiting (unblocks rx FinishAcks)
@@ -169,7 +171,7 @@ against the working tree.
   under IQ1_S quantization noise — unconfirmed. Output is coherent and
   first-token-exact; it is **not** verified byte-identical beyond that.
 
-### 0021-0025 — speculative decoding, confidence gating, and head banding
+### 0021-0026 — speculative decoding, confidence gating, majority drafting, and head banding
 
 - **What it is**: rank0 drafts tokens by matching the current sequence against its own
   generation history (no second model), verifies the whole draft in one batched forward
@@ -216,6 +218,11 @@ against the working tree.
 
   Average bracketing baseline: 6.07705 tok/s. Draft acceptance in both gated
   configurations was 59/64 = 0.9219; the serve/guard merge did not change it.
+- **0026 result**: with K=4, n=[1,8], at least 2 occurrences, recursive 2/3 majority,
+  and head banding, structured generation measured 10.3002 and 11.3231 tok/s on the two
+  candidate sides of a matched 6.4272 baseline (10.8117 candidate average, +68.2%). Both
+  candidate runs accepted 95/95 drafts. The bracketed four-request mean was 9.2345, so
+  do not turn this into a claim that every workload or the general mean exceeds 10.
 - **Correctness**: verified as "always a valid greedy decoding trajectory," not
   byte-identical to non-speculative decoding (see the NCCL finding above — closing that
   gap needs a count-*and*-offset-invariant collective, not yet built, tracked as a
@@ -235,7 +242,7 @@ against the working tree.
   IQ1_S-compressed target, and there's no spare memory on a Spark for a second model's
   weights anyway) and TP4. Full design rationale, break-even math, and the staged
   verification process: [`docs/SPECULATIVE-DECODING-DESIGN.md`](docs/SPECULATIVE-DECODING-DESIGN.md).
-- **Apply note**: the rebased 0021–0025 patches are ordinary mail patches. Apply them
+- **Apply note**: the rebased 0021–0026 patches are ordinary mail patches. Apply them
   with `git am` exactly as shown above; no whitespace override is required.
 
 ## TPS measurement run
@@ -262,6 +269,6 @@ boundary — a pre-0019 engine is faster only because it is skipping work.
 Confirm from the run's own logs: rank0 stderr must show
 `[k3-dist] caps probe(blk.3): q_lora=1 attn_gate=1 shexp=1 routed_norm=1`.
 
-The clean-room audit covers the complete chain through **0025**: 27 plain `git am`
-applications from the pinned base, zero dirty files, and a tree byte-identical to
-the fleet build. Do not extend that claim to later unverified working-tree changes.
+The clean-room audit covers the chain through **0025**, and 0026 was separately
+plain-`git am` applied to that exact clean tip, built, correctness-gated, and measured on
+the fleet. Do not extend that claim to later unverified working-tree changes.

@@ -145,9 +145,9 @@ Entry shard:
 $HOME/models/kimi-k3-neuron-iq1s-local/k3-neuron-iq1s-00001-of-00009.gguf
 ```
 
-### 2. Build + apply the verified chain through 0025
+### 2. Build + apply the verified chain through 0026
 
-See **[`APPLY.md`](APPLY.md)** and use its exact 27-patch order from the pinned base.
+See **[`APPLY.md`](APPLY.md)** and use its exact 28-patch order from the pinned base.
 Build targets should include `kimi_k3_dist_generate` and ship:
 
 ```text
