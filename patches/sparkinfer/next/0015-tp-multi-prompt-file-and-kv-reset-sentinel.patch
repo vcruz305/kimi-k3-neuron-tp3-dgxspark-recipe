@@ -1,0 +1,336 @@
+From d33730dd8492093566beba321c707e64c9e68ed2 Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Mon, 10 Aug 2026 23:30:00 -0700
+Subject: [PATCH] tp: 0015 multi-prompt --prompts-file and the KV-reset
+ sentinel
+
+Adds rank0 `--prompts-file F`: one CSV token-id line per prompt, run back to
+back against a single weight load. On a 3-Spark TP3 fleet a load costs ~5m45s
+even after 0013, so amortising it across a benchmark set is the difference
+between a 6-prompt sweep taking 6 minutes and taking 40.
+
+Between prompts the sequence has to be cut cleanly or prompt N+1 decodes with
+prompt N still in the KV cache and the KDA recurrent state. There is no
+existing control message for "reset" -- the rank protocol only carries token
+ids -- so this reuses that channel with a reserved negative id:
+
+    constexpr int kKvResetSentinel = -2;
+
+Rank0 broadcasts -2 through the same one_step() path a real token takes, and
+both sides (rank0's one_step, the worker's wait_token loop) intercept it before
+the forward call, run kimi_k3_reset_state() + cudaStreamSynchronize, and
+complete the step normally. Every rank therefore resets in lockstep inside the
+existing barrier structure, with no new frame type and no protocol version
+bump. -2 is safe as a sentinel because real ids are non-negative and -1 is
+already the loop's termination value.
+
+Per-prompt timing lines are tagged with `prompt=%zu` so a multi-prompt run
+stays machine-parseable, and a `multi_summary` line reports the mean decode
+tok/s across prompts. Single-prompt behaviour is unchanged: without
+--prompts-file the prompt list is built from --prompt-ids/--prompt-ids-file
+exactly as before and the loop runs once, so no existing invocation or measured
+number is affected.
+
+Provenance: this feature was written and run on the fleet before 0014 but was
+never captured as a numbered patch, which is why 0014 -- diffed against a tree
+that already had it -- carries `kKvResetSentinel` and the multi-prompt comments
+as unchanged *context* lines and fails to apply on a clean 0001-0013 checkout.
+APPLY.md reserved 0015 for it. This commit is that capture: the file content is
+the rank0 working copy taken before 0014 was written, and the resulting tree is
+byte-exact for 0014's context (verified: `git am 0001..0024` with this patch
+inserted between 0013 and 0014 applies all 25 patches on a fresh clone of
+7a9b77a043596157d74e4af376cf9f29f68ce368).
+
+Independently exonerated as not-the-bug during the 0019 correctness
+investigation: this diff was surgically reverted and the engine's output was
+bit-identical to baseline, so it is not implicated in the capability-flags
+defect 0019 fixed.
+---
+ runtime/examples/kimi_k3_dist_generate.cpp | 205 ++++++++++++++++-----
+ 1 file changed, 156 insertions(+), 49 deletions(-)
+
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+index b1b93c3..f8604af 100644
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -28,6 +28,7 @@
+ #include <string>
+ #include <thread>
+ #include <vector>
++#include <cuda_runtime.h>
+ 
+ using namespace sparkinfer;
+ using namespace sparkinfer::tp::dist;
+@@ -46,8 +47,11 @@ void usage(const char* argv0) {
+     std::fprintf(stderr,
+                  "usage: %s --rank R --world 3|4 (--listen HOST:PORT | --coord HOST:PORT)\n"
+                  "          --model FIRST.gguf [--prompt-ids 1,2,3] [--prompt-ids-file F]\n"
++                 "          [--prompts-file F]   # multi-prompt: one CSV id-line per prompt; load once\n"
+                  "          [--n-predict N] [--max-ctx N] [--device 0]\n"
+-                 "          [--session-id N] [--dry-protocol]\n",
++                 "          [--session-id N] [--dry-protocol]\n"
++                 "\n"
++                 "  KV reset sentinel token id = -2 (broadcast between multi-prompts).\n",
+                  argv0);
+ }
+ 
+@@ -77,6 +81,31 @@ std::vector<int> load_ids_file(const std::string& path) {
+     return out;
+ }
+ 
++// Multi-prompt file: one prompt per non-empty, non-# line.
++// Each line is comma-separated token ids (spaces allowed).
++// Example:
++//   1,2,3
++//   10, 20, 30
++std::vector<std::vector<int>> load_prompts_file(const std::string& path) {
++    std::ifstream in(path);
++    std::vector<std::vector<int>> prompts;
++    std::string line;
++    while (std::getline(in, line)) {
++        // trim
++        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
++            line.pop_back();
++        size_t a = 0;
++        while (a < line.size() && (line[a] == ' ' || line[a] == '\t')) ++a;
++        if (a >= line.size() || line[a] == '#') continue;
++        auto ids = parse_ids_csv(line.substr(a));
++        if (!ids.empty()) prompts.push_back(std::move(ids));
++    }
++    return prompts;
++}
++
++// Special token: rank0 broadcasts this between multi-prompts; all ranks reset KV.
++constexpr int kKvResetSentinel = -2;
++
+ void fill_digests(RankSpec* spec) {
+     const std::string mid = "Kimi-K3-Neuron-IQ1S-GGUF";
+     const std::string pid = plan_identity_string(spec->world_size);
+@@ -93,7 +122,7 @@ void fill_digests(RankSpec* spec) {
+ int main(int argc, char** argv) {
+     int rank = -1, world = 3, device = 0, n_predict = 8, max_ctx = 8192;
+     std::uint64_t session_id = 1;
+-    std::string model, listen, coord, prompt_csv, prompt_file;
++    std::string model, listen, coord, prompt_csv, prompt_file, prompts_file;
+     bool dry_protocol = false;
+ 
+     for (int i = 1; i < argc; ++i) {
+@@ -113,6 +142,8 @@ int main(int argc, char** argv) {
+         else if (!std::strcmp(argv[i], "--prompt-ids")) prompt_csv = need("--prompt-ids");
+         else if (!std::strcmp(argv[i], "--prompt-ids-file"))
+             prompt_file = need("--prompt-ids-file");
++        else if (!std::strcmp(argv[i], "--prompts-file"))
++            prompts_file = need("--prompts-file");
+         else if (!std::strcmp(argv[i], "--n-predict")) n_predict = std::atoi(need("--n-predict"));
+         else if (!std::strcmp(argv[i], "--max-ctx")) max_ctx = std::atoi(need("--max-ctx"));
+         else if (!std::strcmp(argv[i], "--session-id"))
+@@ -256,14 +287,24 @@ int main(int argc, char** argv) {
+         }
+         gen_trace("rank0 bootstrap+load complete; starting prompt loop");
+ 
+-        std::vector<int> prompt;
+-        if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
+-        else if (!prompt_csv.empty()) prompt = parse_ids_csv(prompt_csv);
+-        else prompt = {1};
+-        if (prompt.empty()) {
++        // Build prompt list: multi-prompt file OR single prompt.
++        std::vector<std::vector<int>> prompts;
++        if (!prompts_file.empty()) {
++            prompts = load_prompts_file(prompts_file);
++        } else {
++            std::vector<int> prompt;
++            if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
++            else if (!prompt_csv.empty()) prompt = parse_ids_csv(prompt_csv);
++            else prompt = {1};
++            if (!prompt.empty()) prompts.push_back(std::move(prompt));
++        }
++        if (prompts.empty()) {
+             std::fprintf(stderr, "empty prompt ids\n");
+             return 2;
+         }
++        std::printf("[rank0] prompts=%zu n_predict=%d max_ctx=%d (multi-prompt keeps weights loaded)\n",
++                    prompts.size(), n_predict, max_ctx);
++        std::fflush(stdout);
+ 
+         std::vector<float> logits((size_t)dist.cfg.vocab);
+ 
+@@ -278,6 +319,27 @@ int main(int argc, char** argv) {
+                 std::fflush(stderr);
+                 return false;
+             }
++            // KV reset sentinel: all ranks zero KV / position without a model forward.
++            if (tok == kKvResetSentinel) {
++                gen_trace("rank0 KV reset sentinel");
++                kimi_k3_reset_state(dist.state);
++                if (cudaStreamSynchronize(dist.stream) != cudaSuccess) {
++                    std::fprintf(stderr, "cudaStreamSynchronize after KV reset failed\n");
++                    return false;
++                }
++                if (!ctr.complete_local_step(true, 0, "", &err)) {
++                    std::fprintf(stderr, "complete_local_step(reset): %s\n", err.c_str());
++                    std::fflush(stderr);
++                    return false;
++                }
++                if (!ctr.pump(std::chrono::milliseconds(600000), &err)) {
++                    std::fprintf(stderr, "pump(reset): %s\n", err.c_str());
++                    std::fflush(stderr);
++                    return false;
++                }
++                gen_trace("rank0 KV reset complete");
++                return true;
++            }
+             gen_trace("rank0 begin_step ok; forward enter");
+             if (!kimi_k3_dist_forward_token(dist, *coll, tok, logits_out, &err)) {
+                 std::fprintf(stderr, "forward: %s\n", err.c_str());
+@@ -303,54 +365,85 @@ int main(int argc, char** argv) {
+         };
+ 
+         using clock = std::chrono::steady_clock;
+-        const auto t_prefill0 = clock::now();
+-        for (size_t i = 0; i < prompt.size(); ++i) {
+-            float* lp = (i + 1 == prompt.size()) ? logits.data() : nullptr;
+-            if (!one_step(prompt[i], lp)) return 1;
+-        }
+-        const auto t_prefill1 = clock::now();
+-        const double prefill_s =
+-            std::chrono::duration<double>(t_prefill1 - t_prefill0).count();
+-        std::printf("prefill done (%zu toks) in %.3fs\n", prompt.size(), prefill_s);
+-        std::fflush(stdout);
+-        std::fprintf(stderr,
+-                     "[k3-dist][tps] prefill_tokens=%zu prefill_s=%.6f prefill_tok_s=%.4f\n",
+-                     prompt.size(), prefill_s,
+-                     prefill_s > 0 ? (double)prompt.size() / prefill_s : 0.0);
+-        std::fflush(stderr);
++        double sum_decode_tps = 0.0;
++        int n_ok = 0;
+ 
+-        std::vector<int> generated;
+-        const auto t_gen0 = clock::now();
+-        for (int n = 0; n < n_predict; ++n) {
+-            const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
+-            generated.push_back(next);
+-            std::printf(" gen[%d]=%d\n", n, next);
++        for (size_t pi = 0; pi < prompts.size(); ++pi) {
++            const auto& prompt = prompts[pi];
++            std::printf("\n==== prompt %zu/%zu (ids=%zu) ====\n", pi + 1, prompts.size(),
++                        prompt.size());
+             std::fflush(stdout);
+-            {
+-                char buf[96];
+-                std::snprintf(buf, sizeof(buf), "rank0 gen[%d]=%d", n, next);
+-                gen_trace(buf);
++            std::fprintf(stderr, "[k3-dist][multi] prompt %zu/%zu n_ids=%zu\n", pi + 1,
++                         prompts.size(), prompt.size());
++            std::fflush(stderr);
++
++            // Between prompts: broadcast KV reset so sequences do not contaminate.
++            if (pi > 0) {
++                if (!one_step(kKvResetSentinel, nullptr)) return 1;
++            }
++
++            const auto t_prefill0 = clock::now();
++            for (size_t i = 0; i < prompt.size(); ++i) {
++                float* lp = (i + 1 == prompt.size()) ? logits.data() : nullptr;
++                if (!one_step(prompt[i], lp)) return 1;
+             }
+-            if (!one_step(next, logits.data())) return 1;
++            const auto t_prefill1 = clock::now();
++            const double prefill_s =
++                std::chrono::duration<double>(t_prefill1 - t_prefill0).count();
++            std::printf("prefill done (%zu toks) in %.3fs\n", prompt.size(), prefill_s);
++            std::fflush(stdout);
++            std::fprintf(stderr,
++                         "[k3-dist][tps] prompt=%zu prefill_tokens=%zu prefill_s=%.6f "
++                         "prefill_tok_s=%.4f\n",
++                         pi, prompt.size(), prefill_s,
++                         prefill_s > 0 ? (double)prompt.size() / prefill_s : 0.0);
++            std::fflush(stderr);
++
++            std::vector<int> generated;
++            const auto t_gen0 = clock::now();
++            for (int n = 0; n < n_predict; ++n) {
++                const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
++                generated.push_back(next);
++                std::printf(" gen[%d]=%d\n", n, next);
++                std::fflush(stdout);
++                {
++                    char buf[96];
++                    std::snprintf(buf, sizeof(buf), "rank0 gen[%d]=%d", n, next);
++                    gen_trace(buf);
++                }
++                if (!one_step(next, logits.data())) return 1;
++            }
++            const auto t_gen1 = clock::now();
++            const double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
++            const double decode_tps = gen_s > 0 ? (double)n_predict / gen_s : 0.0;
++            sum_decode_tps += decode_tps;
++            ++n_ok;
++            std::printf("OK generated %zu tokens in %.3fs (decode_tok_s=%.4f) prompt=%zu\n",
++                        generated.size(), gen_s, decode_tps, pi);
++            std::fflush(stdout);
++            std::fprintf(stderr,
++                         "[k3-dist][tps] prompt=%zu decode_tokens=%d decode_s=%.6f "
++                         "decode_tok_s=%.4f\n",
++                         pi, n_predict, gen_s, decode_tps);
++            std::fprintf(stderr, "[k3-dist][tps] prompt=%zu generated_ids=", pi);
++            for (size_t i = 0; i < generated.size(); ++i) {
++                std::fprintf(stderr, "%s%d", i ? "," : "", generated[i]);
++            }
++            std::fprintf(stderr, "\n");
++            std::fflush(stderr);
+         }
+-        const auto t_gen1 = clock::now();
+-        const double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
+-        // Decode TPS: n_predict forward steps after first logits (each step emits one token).
+-        const double decode_tps = gen_s > 0 ? (double)n_predict / gen_s : 0.0;
+-        std::printf("OK generated %zu tokens in %.3fs (decode_tok_s=%.4f)\n", generated.size(),
+-                    gen_s, decode_tps);
+-        std::fflush(stdout);
+-        std::fprintf(stderr,
+-                     "[k3-dist][tps] decode_tokens=%d decode_s=%.6f decode_tok_s=%.4f\n",
+-                     n_predict, gen_s, decode_tps);
+-        std::fprintf(stderr, "[k3-dist][tps] generated_ids=");
+-        for (size_t i = 0; i < generated.size(); ++i) {
+-            std::fprintf(stderr, "%s%d", i ? "," : "", generated[i]);
++
++        if (n_ok > 0) {
++            std::printf("OK multi-prompt summary prompts=%d mean_decode_tok_s=%.4f\n", n_ok,
++                        sum_decode_tps / (double)n_ok);
++            std::fprintf(stderr,
++                         "[k3-dist][tps] multi_summary prompts=%d mean_decode_tok_s=%.4f\n",
++                         n_ok, sum_decode_tps / (double)n_ok);
++            std::fflush(stdout);
++            std::fflush(stderr);
+         }
+-        std::fprintf(stderr, "\n");
+-        std::fflush(stderr);
+-        gen_trace("rank0 finish enter");
+ 
++        gen_trace("rank0 finish enter");
+         if (!ctr.finish(&err)) {
+             std::fprintf(stderr, "finish: %s\n", err.c_str());
+             std::fflush(stderr);
+@@ -415,6 +508,20 @@ int main(int argc, char** argv) {
+             std::snprintf(buf, sizeof(buf), "rank%d wait_token got tok=%d; forward enter", rank, tok);
+             gen_trace(buf);
+         }
++        if (tok == kKvResetSentinel) {
++            gen_trace("worker KV reset sentinel");
++            kimi_k3_reset_state(dist.state);
++            if (cudaStreamSynchronize(dist.stream) != cudaSuccess) {
++                wtr.report_step_done(false, 1, "cudaStreamSynchronize reset failed", nullptr);
++                return 1;
++            }
++            if (!wtr.report_step_done(true, 0, "", &err)) {
++                std::fprintf(stderr, "step_done(reset): %s\n", err.c_str());
++                std::fflush(stderr);
++                return 1;
++            }
++            continue;
++        }
+         if (!kimi_k3_dist_forward_token(dist, *coll, tok, nullptr, &err)) {
+             wtr.report_step_done(false, 1, err, nullptr);
+             std::fprintf(stderr, "forward: %s\n", err.c_str());
+-- 
+2.52.0.windows.1
+

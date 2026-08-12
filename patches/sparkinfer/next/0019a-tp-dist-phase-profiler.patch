@@ -1,0 +1,515 @@
+From 616de865539c5cf73d1e4688fc9ab74754710366 Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 08:00:00 -0700
+Subject: [PATCH] tp: 0019a CUDA-event phase profiler for the dist forward path
+
+Adds `SPARKINFER_K3_DIST_PROFILE=1`: per-phase CUDA-event timings for the
+distributed decode step, broken out as embed / attn / attn_ar / ffn_partial /
+moe_ar / ffn_finish / head / sync_d2h, each with a percentage of the step.
+
+Sampling is deliberately not "every token". Load and the first forwards are
+wildly unrepresentative (allocator warmup, NCCL channel setup, first-touch page
+faults), so the profiler skips a warmup window and then samples a bounded
+number of steady tokens:
+
+    SPARKINFER_K3_DIST_PROFILE_SKIP=N    warm tokens skipped   (default 8)
+    SPARKINFER_K3_DIST_PROFILE_EVERY=N   sample every Nth      (default 1)
+    SPARKINFER_K3_DIST_PROFILE_MAX=N     stop after N samples  (default 16)
+
+The all-reduce buckets also carry their element counts (`n=`), because on this
+engine collective cost tracks payload size and a millisecond number without the
+count is not interpretable.
+
+Mechanism: phases are wrapped in `DistProf::timed()`, which records a CUDA event
+either side of the phase and accumulates the elapsed time. This is why the
+direct `embed_token(...)` call becomes a `run_embed` lambda -- `timed()` needs
+the phase as a callable so the same call site can be used with or without
+instrumentation. When profiling is off, `timed()` sees a null event handle and
+degrades to a plain `fn()` call, so the profile-off path is the original code
+with no events, no syncs and no added work.
+
+Note that `timed()` calls `cudaEventSynchronize` per phase, so an ACTIVE profile
+run serializes the step and its absolute tok/s is not a valid benchmark number.
+The percentages are the output to read, not the totals.
+
+This is the instrumentation the TP3 decode-time breakdown came from (attention
+~36.5%, collectives ~26.2%, MoE ffn_partial ~23.5%), which is what established
+that this engine is bandwidth-bound and pointed the speed campaign at
+speculative decoding rather than more kernel tuning.
+
+Provenance: like the multi-prompt feature captured as 0015, this was written and
+used on the fleet but never captured as a numbered patch. Patch 0020 was diffed
+against a tree that already had it, so 0020 carries `run_embed` as an unchanged
+*context* line and cannot apply to a clean 0001-0019 checkout without this.
+Numbered 0019a rather than renumbering the series, since 0020+ are already
+referenced by number in APPLY.md and elsewhere.
+
+The two comment deletions and the blank-line removal in this diff are incidental
+working-tree noise, not intentional changes; they are included because
+reproducing the exact tree 0020 was diffed against is the whole point of the
+capture.
+---
+ runtime/src/models/kimi_k3_dist_forward.cpp | 347 ++++++++++++++++----
+ 1 file changed, 274 insertions(+), 73 deletions(-)
+
+diff --git a/runtime/src/models/kimi_k3_dist_forward.cpp b/runtime/src/models/kimi_k3_dist_forward.cpp
+index 5ccdfcb..29d0075 100755
+--- a/runtime/src/models/kimi_k3_dist_forward.cpp
++++ b/runtime/src/models/kimi_k3_dist_forward.cpp
+@@ -2,9 +2,13 @@
+ 
+ #include "sparkinfer/kernels/kimi_k3.h"
+ 
+-#include <cstdint>
++#include <cuda_runtime.h>
++
++#include <algorithm>
+ #include <chrono>
++#include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <vector>
+ 
+@@ -13,7 +17,6 @@ namespace k3k = sparkinfer::kernels::k3;
+ namespace sparkinfer {
+ namespace {
+ 
+-
+ void dist_trace(const char* msg) {
+     using clock = std::chrono::steady_clock;
+     static const auto t0 = clock::now();
+@@ -29,7 +32,6 @@ void set_err(std::string* error, const std::string& v) {
+ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
+                  float* x, cudaStream_t stream) {
+     if (!w.token_embd.ok()) return false;
+-    // Mirror single-GPU / TP embed: F32, F16 (Neuron release), Q8_0.
+     long row_bytes = 0;
+     if (w.token_embd.type == 0)
+         row_bytes = (long)cfg.hidden * sizeof(float);
+@@ -45,7 +47,7 @@ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
+ 
+ bool ensure_logits(KimiK3DistRank& rank) {
+     if (rank.logits) return true;
+-    if (rank.plan.spec.rank != 0) return true;  // workers skip head
++    if (rank.plan.spec.rank != 0) return true;
+     if (cudaMalloc(&rank.logits, (size_t)rank.cfg.vocab * sizeof(float)) != cudaSuccess)
+         return false;
+     return true;
+@@ -68,6 +70,109 @@ bool allreduce_partial(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
+     return true;
+ }
+ 
++// SPARKINFER_K3_DIST_PROFILE=1 → CUDA-event phase times (steady tokens only).
++// SPARKINFER_K3_DIST_PROFILE_SKIP=N (default 8) warm tokens skipped.
++// SPARKINFER_K3_DIST_PROFILE_EVERY=N (default 1) sample every Nth after skip.
++// SPARKINFER_K3_DIST_PROFILE_MAX=N (default 16) max samples then stop printing.
++struct DistProf {
++    bool on = false;
++    int skip = 8;
++    int every = 1;
++    int max_samples = 16;
++    int token_i = 0;
++    int samples = 0;
++    cudaEvent_t a = nullptr;
++    cudaEvent_t b = nullptr;
++    float sum_embed = 0, sum_attn = 0, sum_attn_ar = 0, sum_ffn_p = 0;
++    float sum_moe_ar = 0, sum_ffn_f = 0, sum_head = 0, sum_sync = 0, sum_total = 0;
++    long sum_n_attn_ar = 0, sum_n_moe_ar = 0;
++
++    static DistProf& get() {
++        static DistProf P;
++        static bool init = false;
++        if (!init) {
++            init = true;
++            const char* e = std::getenv("SPARKINFER_K3_DIST_PROFILE");
++            P.on = e && e[0] == '1';
++            if (const char* s = std::getenv("SPARKINFER_K3_DIST_PROFILE_SKIP"))
++                P.skip = std::atoi(s);
++            if (const char* s = std::getenv("SPARKINFER_K3_DIST_PROFILE_EVERY"))
++                P.every = std::max(1, std::atoi(s));
++            if (const char* s = std::getenv("SPARKINFER_K3_DIST_PROFILE_MAX"))
++                P.max_samples = std::max(1, std::atoi(s));
++            if (P.on) {
++                cudaEventCreate(&P.a);
++                cudaEventCreate(&P.b);
++            }
++        }
++        return P;
++    }
++
++    bool active_this_token() {
++        if (!on || samples >= max_samples) return false;
++        if (token_i < skip) return false;
++        return ((token_i - skip) % every) == 0;
++    }
++
++    template <class Fn>
++    bool timed(cudaStream_t stream, float& bucket, Fn&& fn) {
++        if (!a) return fn();
++        if (cudaEventRecord(a, stream) != cudaSuccess) return false;
++        if (!fn()) return false;
++        if (cudaEventRecord(b, stream) != cudaSuccess) return false;
++        if (cudaEventSynchronize(b) != cudaSuccess) return false;
++        float ms = 0.f;
++        if (cudaEventElapsedTime(&ms, a, b) != cudaSuccess) return false;
++        bucket += ms;
++        return true;
++    }
++
++    void print_sample(int rank, int tok, long n_attn_ar, long n_moe_ar, float emb, float attn,
++                      float attn_ar, float ffn_p, float moe_ar, float ffn_f, float head,
++                      float sync) {
++        const float tot = emb + attn + attn_ar + ffn_p + moe_ar + ffn_f + head + sync;
++        auto pct = [&](float x) { return tot > 0 ? 100.f * x / tot : 0.f; };
++        std::fprintf(stderr,
++                     "[k3-dist][PROFILE] rank=%d sample=%d tok_i=%d tok_id=%d total_ms=%.3f | "
++                     "embed=%.3f (%.1f%%) attn=%.3f (%.1f%%) attn_ar=%.3f (%.1f%% n=%ld) "
++                     "ffn_partial=%.3f (%.1f%%) moe_ar=%.3f (%.1f%% n=%ld) "
++                     "ffn_finish=%.3f (%.1f%%) head=%.3f (%.1f%%) sync_d2h=%.3f (%.1f%%)\n",
++                     rank, samples, token_i, tok, tot, emb, pct(emb), attn, pct(attn), attn_ar,
++                     pct(attn_ar), n_attn_ar, ffn_p, pct(ffn_p), moe_ar, pct(moe_ar), n_moe_ar,
++                     ffn_f, pct(ffn_f), head, pct(head), sync, pct(sync));
++        std::fflush(stderr);
++        sum_embed += emb;
++        sum_attn += attn;
++        sum_attn_ar += attn_ar;
++        sum_ffn_p += ffn_p;
++        sum_moe_ar += moe_ar;
++        sum_ffn_f += ffn_f;
++        sum_head += head;
++        sum_sync += sync;
++        sum_total += tot;
++        sum_n_attn_ar += n_attn_ar;
++        sum_n_moe_ar += n_moe_ar;
++        ++samples;
++        if (samples == max_samples || samples % 4 == 0) {
++            const float inv = 1.f / (float)samples;
++            const float t = sum_total * inv;
++            auto p2 = [&](float s) { return t > 0 ? 100.f * (s * inv) / t : 0.f; };
++            std::fprintf(stderr,
++                         "[k3-dist][PROFILE_AVG] rank=%d n=%d total_ms=%.3f | "
++                         "embed=%.3f (%.1f%%) attn=%.3f (%.1f%%) attn_ar=%.3f (%.1f%%) "
++                         "ffn_partial=%.3f (%.1f%%) moe_ar=%.3f (%.1f%%) "
++                         "ffn_finish=%.3f (%.1f%%) head=%.3f (%.1f%%) sync_d2h=%.3f (%.1f%%) | "
++                         "mean_n_attn_ar=%.1f mean_n_moe_ar=%.1f\n",
++                         rank, samples, t, sum_embed * inv, p2(sum_embed), sum_attn * inv,
++                         p2(sum_attn), sum_attn_ar * inv, p2(sum_attn_ar), sum_ffn_p * inv,
++                         p2(sum_ffn_p), sum_moe_ar * inv, p2(sum_moe_ar), sum_ffn_f * inv,
++                         p2(sum_ffn_f), sum_head * inv, p2(sum_head), sum_sync * inv, p2(sum_sync),
++                         (double)sum_n_attn_ar / samples, (double)sum_n_moe_ar / samples);
++            std::fflush(stderr);
++        }
++    }
++};
++
+ }  // namespace
+ 
+ bool kimi_k3_dist_rank_init_nccl(KimiK3DistRank* rank,
+@@ -110,22 +215,27 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+     const int my_rank = rank.plan.spec.rank;
+     KimiK3Weights& w = rank.weights;
+     KimiK3Forward& fwd = rank.fwd;
++    DistProf& prof = DistProf::get();
++    const bool do_prof = prof.active_this_token();
++    float ms_embed = 0, ms_attn = 0, ms_attn_ar = 0, ms_ffn_p = 0, ms_moe_ar = 0;
++    float ms_ffn_f = 0, ms_head = 0, ms_sync = 0;
++    long n_attn_ar = 0, n_moe_ar = 0;
+ 
+     rank.state.n_ckpt = 0;
+ 
+-    {
+-        char buf[96];
+-        std::snprintf(buf, sizeof(buf), "rank%d embed_token enter tok=%d", my_rank, token_id);
+-        dist_trace(buf);
+-    }
+-    if (!embed_token(w, cfg, token_id, rank.x, rank.stream)) {
+-        set_err(error, "embed_token failed");
+-        return false;
+-    }
+-    {
+-        char buf[96];
+-        std::snprintf(buf, sizeof(buf), "rank%d embed_token ok tok=%d", my_rank, token_id);
+-        dist_trace(buf);
++    auto run_embed = [&]() {
++        return embed_token(w, cfg, token_id, rank.x, rank.stream);
++    };
++    if (do_prof) {
++        if (!prof.timed(rank.stream, ms_embed, run_embed)) {
++            set_err(error, "embed_token failed");
++            return false;
++        }
++    } else {
++        if (!run_embed()) {
++            set_err(error, "embed_token failed");
++            return false;
++        }
+     }
+ 
+     long n_coll = 0;
+@@ -137,56 +247,104 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+             tp_size > 1 && !cfg.is_kda_layer(layer) && KimiK3Weights::shards_mla(w.policy);
+         const bool attn_reduce = kda_reduce || mla_reduce;
+ 
+-        if (!kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::Attn, rank.x, rank.x_next)) {
++        auto run_attn = [&]() {
++            return kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::Attn, rank.x,
++                                               rank.x_next);
++        };
++        if (do_prof) {
++            if (!prof.timed(rank.stream, ms_attn, run_attn)) {
++                set_err(error, "Attn phase failed at layer " + std::to_string(layer));
++                return false;
++            }
++        } else if (!run_attn()) {
+             set_err(error, "Attn phase failed at layer " + std::to_string(layer));
+             return false;
+         }
+ 
+         if (attn_reduce) {
+-            if (layer == 0) {
+-                char buf[96];
+-                std::snprintf(buf, sizeof(buf), "rank%d first attn allreduce enter L0", my_rank);
+-                dist_trace(buf);
+-            }
+-            if (!allreduce_partial(fwd, layer, K3LayerPhase::Attn, coll, rank.stream, error)) {
++            auto run_ar = [&]() {
++                return allreduce_partial(fwd, layer, K3LayerPhase::Attn, coll, rank.stream,
++                                         error);
++            };
++            if (do_prof) {
++                if (!prof.timed(rank.stream, ms_attn_ar, run_ar)) {
++                    if (error && error->empty())
++                        set_err(error, "attn allreduce failed layer " + std::to_string(layer));
++                    return false;
++                }
++            } else if (!run_ar()) {
+                 if (error && error->empty())
+                     set_err(error, "attn allreduce failed layer " + std::to_string(layer));
+                 return false;
+             }
+-            if (layer == 0) dist_trace("first attn allreduce ok L0");
+             ++n_coll;
+-            if (!kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::FfnPartial, rank.x,
+-                                             rank.x_next)) {
+-                set_err(error, "FfnPartial after attn-reduce failed layer " +
+-                                   std::to_string(layer));
++            ++n_attn_ar;
++            auto run_ffn_p = [&]() {
++                return kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::FfnPartial, rank.x,
++                                                   rank.x_next);
++            };
++            if (do_prof) {
++                if (!prof.timed(rank.stream, ms_ffn_p, run_ffn_p)) {
++                    set_err(error, "FfnPartial after attn-reduce failed layer " +
++                                       std::to_string(layer));
++                    return false;
++                }
++            } else if (!run_ffn_p()) {
++                set_err(error,
++                        "FfnPartial after attn-reduce failed layer " + std::to_string(layer));
+                 return false;
+             }
+         } else {
+-            if (!kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::FfnPartial, rank.x,
+-                                             rank.x_next)) {
++            auto run_ffn_p = [&]() {
++                return kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::FfnPartial, rank.x,
++                                                   rank.x_next);
++            };
++            if (do_prof) {
++                if (!prof.timed(rank.stream, ms_ffn_p, run_ffn_p)) {
++                    set_err(error, "FfnPartial failed layer " + std::to_string(layer));
++                    return false;
++                }
++            } else if (!run_ffn_p()) {
+                 set_err(error, "FfnPartial failed layer " + std::to_string(layer));
+                 return false;
+             }
+         }
+ 
+-        // MoE width/expert partial must be summed before FfnFinish (rms_norm not linear).
+         if (is_moe && tp_size > 1) {
+-            if (!allreduce_partial(fwd, layer, K3LayerPhase::FfnPartial, coll, rank.stream,
+-                                   error)) {
++            auto run_moe_ar = [&]() {
++                return allreduce_partial(fwd, layer, K3LayerPhase::FfnPartial, coll, rank.stream,
++                                         error);
++            };
++            if (do_prof) {
++                if (!prof.timed(rank.stream, ms_moe_ar, run_moe_ar)) {
++                    if (error && error->empty())
++                        set_err(error, "moe allreduce failed layer " + std::to_string(layer));
++                    return false;
++                }
++            } else if (!run_moe_ar()) {
+                 if (error && error->empty())
+                     set_err(error, "moe allreduce failed layer " + std::to_string(layer));
+                 return false;
+             }
+             ++n_coll;
++            ++n_moe_ar;
+         }
+ 
+-        if (!kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::FfnFinish, rank.x,
+-                                         rank.x_next)) {
++        auto run_ffn_f = [&]() {
++            return kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::FfnFinish, rank.x,
++                                               rank.x_next);
++        };
++        if (do_prof) {
++            if (!prof.timed(rank.stream, ms_ffn_f, run_ffn_f)) {
++                set_err(error, "FfnFinish failed layer " + std::to_string(layer));
++                return false;
++            }
++        } else if (!run_ffn_f()) {
+             set_err(error, "FfnFinish failed layer " + std::to_string(layer));
+             return false;
+         }
+         std::swap(rank.x, rank.x_next);
+-        if (layer == 0 || layer + 1 == cfg.n_layers || ((layer + 1) % 16) == 0) {
++        if (!do_prof && (layer == 0 || layer + 1 == cfg.n_layers || ((layer + 1) % 16) == 0)) {
+             char buf[128];
+             std::snprintf(buf, sizeof(buf), "rank%d layer %d/%d done coll=%ld", my_rank, layer + 1,
+                           cfg.n_layers, n_coll);
+@@ -194,58 +352,101 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+         }
+     }
+ 
+-    // Head: only rank 0 holds output.weight under dist load policy.
+     if (my_rank == 0) {
+-        if (!ensure_logits(rank)) {
+-            set_err(error, "logits cudaMalloc failed");
+-            return false;
+-        }
+-        if (cfg.attn_res_block_size > 0) {
+-            if (!w.has_output_res_score || !w.output_res_score.ok()) {
+-                set_err(error, "missing output_res_score");
++        auto run_head = [&]() {
++            if (!ensure_logits(rank)) {
++                set_err(error, "logits cudaMalloc failed");
+                 return false;
+             }
+-            k3k::attn_res_mix_f32(rank.x_next, rank.state.res_bank, rank.x,
+-                                  (const float*)w.output_res_score.data, H, rank.state.n_ckpt,
+-                                  cfg.rms_eps, rank.stream);
+-            std::swap(rank.x, rank.x_next);
+-        }
+-        if (!w.output_norm.ok() || !w.output.ok()) {
+-            set_err(error, "missing output_norm/output");
+-            return false;
+-        }
+-        k3k::rms_norm_f32(rank.x_next, rank.x, (const float*)w.output_norm.data, H,
+-                          cfg.rms_eps, rank.stream);
+-        if (!k3k::k3_proj_f32(rank.logits, rank.x_next, w.output.data, w.output.type,
+-                              cfg.vocab, H, rank.stream)) {
+-            set_err(error, "lm head proj failed");
++            if (cfg.attn_res_block_size > 0) {
++                if (!w.has_output_res_score || !w.output_res_score.ok()) {
++                    set_err(error, "missing output_res_score");
++                    return false;
++                }
++                k3k::attn_res_mix_f32(rank.x_next, rank.state.res_bank, rank.x,
++                                      (const float*)w.output_res_score.data, H, rank.state.n_ckpt,
++                                      cfg.rms_eps, rank.stream);
++                std::swap(rank.x, rank.x_next);
++            }
++            if (!w.output_norm.ok() || !w.output.ok()) {
++                set_err(error, "missing output_norm/output");
++                return false;
++            }
++            k3k::rms_norm_f32(rank.x_next, rank.x, (const float*)w.output_norm.data, H,
++                              cfg.rms_eps, rank.stream);
++            if (!k3k::k3_proj_f32(rank.logits, rank.x_next, w.output.data, w.output.type,
++                                  cfg.vocab, H, rank.stream)) {
++                set_err(error, "lm head proj failed");
++                return false;
++            }
++            return true;
++        };
++        if (do_prof) {
++            if (!prof.timed(rank.stream, ms_head, run_head)) return false;
++        } else if (!run_head()) {
+             return false;
+         }
+         if (out_logits_host) {
+-            if (cudaStreamSynchronize(rank.stream) != cudaSuccess) {
+-                set_err(error, "stream sync before logits D2H failed");
++            // Async D2H on compute stream + one sync (no default-stream barrier).
++            auto run_sync = [&]() {
++                if (cudaMemcpyAsync(out_logits_host, rank.logits,
++                                    (size_t)cfg.vocab * sizeof(float),
++                                    cudaMemcpyDeviceToHost, rank.stream) != cudaSuccess) {
++                    set_err(error, "logits D2H async failed");
++                    return false;
++                }
++                if (cudaStreamSynchronize(rank.stream) != cudaSuccess) {
++                    set_err(error, "stream sync after logits D2H failed");
++                    return false;
++                }
++                return true;
++            };
++            if (do_prof) {
++                using clock = std::chrono::steady_clock;
++                const auto t0 = clock::now();
++                if (!run_sync()) return false;
++                ms_sync = std::chrono::duration<float, std::milli>(clock::now() - t0).count();
++            } else if (!run_sync()) {
+                 return false;
+             }
+-            if (cudaMemcpy(out_logits_host, rank.logits,
+-                           (size_t)cfg.vocab * sizeof(float),
+-                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+-                set_err(error, "logits D2H failed");
++        }
++    } else {
++        // Workers: no per-token full stream sync in production. Work stays ordered on
++        // rank.stream; position bump is stream-ordered. Full sync drained pipelines and
++        // amplified multi-rank AR skew. Profile mode still syncs for timing.
++        if (do_prof) {
++            using clock = std::chrono::steady_clock;
++            const auto t0 = clock::now();
++            if (cudaStreamSynchronize(rank.stream) != cudaSuccess) {
++                set_err(error, "worker stream sync failed");
+                 return false;
+             }
++            ms_sync = std::chrono::duration<float, std::milli>(clock::now() - t0).count();
+         }
+-    } else {
+-        // Workers still need stream-ordered progress and matching KDA/KV state.
+-        if (cudaStreamSynchronize(rank.stream) != cudaSuccess) {
+-            set_err(error, "worker stream sync failed");
++    }
++
++    // Stream-ordered position advance (avoid kimi_k3_set_position default-stream H2D).
++    {
++        const int next_pos = rank.state.position + 1;
++        if (next_pos < 0) {
++            set_err(error, "kimi_k3_set_position failed");
+             return false;
+         }
++        rank.state.position = next_pos;
++        if (rank.state.d_pos) {
++            if (cudaMemcpyAsync(rank.state.d_pos, &rank.state.position, sizeof(int),
++                                cudaMemcpyHostToDevice, rank.stream) != cudaSuccess) {
++                set_err(error, "d_pos H2D async failed");
++                return false;
++            }
++        }
+     }
+ 
+-    // Advance device position (KV / KDA index) and host mirror together.
+-    if (!kimi_k3_set_position(rank.state, rank.state.position + 1)) {
+-        set_err(error, "kimi_k3_set_position failed");
+-        return false;
++    if (do_prof) {
++        prof.print_sample(my_rank, token_id, n_attn_ar, n_moe_ar, ms_embed, ms_attn, ms_attn_ar,
++                          ms_ffn_p, ms_moe_ar, ms_ffn_f, ms_head, ms_sync);
+     }
++    ++prof.token_i;
+ 
+     (void)n_coll;
+     return true;
+-- 
+2.52.0.windows.1
+

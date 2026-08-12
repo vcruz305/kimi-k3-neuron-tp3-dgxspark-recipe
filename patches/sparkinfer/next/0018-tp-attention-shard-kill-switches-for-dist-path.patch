@@ -39,8 +39,8 @@ ships a new launcher against the OLD runtime and fails SILENTLY -- no version
 check, no error, it just runs the previous code. Deploy both, and verify with
   strings dist/libsparkinfer_runtime.so | grep <a string from your change>
 ---
- runtime/src/models/kimi_k3_dist_rank.cpp | 25 +++++++++++++++++++++++--
- 1 file changed, 23 insertions(+), 2 deletions(-)
+ runtime/src/models/kimi_k3_dist_rank.cpp | 23 +++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 1 deletion(-)
 
 diff --git a/runtime/src/models/kimi_k3_dist_rank.cpp b/runtime/src/models/kimi_k3_dist_rank.cpp
 --- a/runtime/src/models/kimi_k3_dist_rank.cpp
@@ -78,6 +78,7 @@ diff --git a/runtime/src/models/kimi_k3_dist_rank.cpp b/runtime/src/models/kimi_
 +                     spec.rank, (int)p, (int)k, (int)m);
 +        out->weights.policy = p;
 +    }
++
      out->weights.shard = out->plan.dims;
      out->weights.shard.tp_size = spec.world_size;
      out->weights.shard.rank = spec.rank;

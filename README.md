@@ -30,7 +30,7 @@ Serves the 330 GB Kimi-K3 Neuron IQ1_S GGUF across 3 or 4 NVIDIA DGX Spark (GB10
 |---|---|
 | **This recipe** | [`github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe`](https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe) |
 | **Model (GGUF)** | [`huggingface.co/vcruz305/Kimi-K3-Neuron-IQ1S-GGUF`](https://huggingface.co/vcruz305/Kimi-K3-Neuron-IQ1S-GGUF) (~330 GB) |
-| Patches | `0001`–`0024`, applied on top of upstream `sparkinfer-k3` — see [`APPLY.md`](APPLY.md) |
+| Patches | `0001`–`0020` verified applying/building from a fresh clone; `0021`–`0024` (speculative decoding) are measured on the fleet but **not currently reproducible from a fresh clone** — see [`APPLY.md`](APPLY.md#series-status--what-actually-applies) |
 | Full data | benchmarks, geometry, run steps, non-claims → [`DETAILS.md`](DETAILS.md) |
 
 ## Why SparkInfer
@@ -121,8 +121,18 @@ throughout. Backed by 1000+ automated correctness checks (see the patch series b
 
 ### Usage
 
-Apply patches `0021`→`0022`→`0023`→`0024` in order on top of `0020` (each depends on the
-one before it touching the same files). Rebuild `kimi_k3_dist_generate` and
+**Known gap, disclosed here rather than left for you to discover:** a clean-room
+apply audit found that `0021`–`0024`, as stored, do not currently `git am` cleanly
+on top of `0020` — they were diffed against a tree missing `0014` and `0016`, and
+two test targets they reference are never registered in `CMakeLists.txt`. The
+results below are real fleet measurements; the patches just need a rebase before
+they'll apply from this repo. See
+[APPLY.md's series status](APPLY.md#series-status--what-actually-applies) for the
+full root cause before you sink time into applying them by hand.
+
+Once rebased, the intended sequence is patches `0021`→`0022`→`0023`→`0024` in
+order on top of `0020` (each depends on the one before it touching the same
+files). Rebuild `kimi_k3_dist_generate` and
 `libsparkinfer_runtime.so` and redeploy both to every rank (same sha256sum discipline as
 the base recipe — **do not skip verifying the `.so`**, a stale runtime library behind a
 fresh binary fails silently). Patch `0024` bumps the internal rank-to-rank protocol
