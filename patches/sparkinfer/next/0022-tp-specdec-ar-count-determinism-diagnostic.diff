@@ -1,0 +1,481 @@
+From 0000000000000000000000000000000000000g Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 19:40:00 -0700
+Subject: [PATCH] tp: 0022 root-cause the batched-verify "token 0 depends on K"
+ anomaly, and re-measure m so the slope means something
+
+APPLY WITH: git apply --ignore-whitespace 0022-*.diff
+(verified on the fleet: reproduces the built source byte-for-byte modulo line
+endings. Plain `git apply` and GNU `patch` both refuse, because
+runtime/src/models/kimi_k3_dist_forward.cpp carries CRLF in this working tree
+while the rest of it is LF -- a pre-existing condition, not introduced here.
+Patch 0021 is itself stored CRLF and has the same problem; worth normalising the
+series before it is pushed.)
+
+DIAGNOSTIC ONLY. The engine change is inert unless SPARKINFER_K3_AR_PAD is set;
+with it unset this binary reproduced patch 0021's measured numbers to all nine
+printed digits (K=2 pos=0 cos=0.998947945, max|d|=5.615e-01), which is the
+inertness proof. The rest is --spec-bench instrumentation.
+
+=========================== PART 1: THE ANOMALY ===========================
+
+0021's --spec-bench reported that token 0's logits from
+kimi_k3_dist_forward_batch(K) changed with K -- cos vs the sequential
+single-token reference 0.998948 at K=2, 0.998871 at K=3, 0.998446 at K=4 and
+flat thereafter. Token 0's correct output cannot depend on how many tokens
+follow it, so this was either cross-token contamination (a defect) or a
+shape-driven re-association (numerics). 0021 tried to separate the two with
+SPARKINFER_K3_MOE_BATCH=0, got identical results either way, and recorded that
+as inconclusive on the theory that the expert-major regroup might be declining
+below its own token floor at K <= 8 and never running in either arm.
+
+THAT THEORY IS WRONG AND THE TEST WAS VALID. The regroup's floor is
+k3_moe_batch_min_tok(), which defaults to 2 -- "every batched call"
+(k3_kernels.cu:5148-5161, gate at :5265). K=2..8 clears it, and the rest of the
+contract passes at this geometry (IQ1_S is ggml_type 19, accepted at :5268;
+latent 3584 % 256 == 0 and ffn 1536 % 256 == 0 at :5267). The regroup WAS
+engaged, MOE_BATCH=0 genuinely switched it off, and the two agreeing exonerates
+it rather than proving nothing.
+
+TWO PROBES ADDED, AND WHAT THEY ESTABLISHED.
+
+1. FILLER INVARIANCE. Hold K fixed, hold token 0 fixed, replace tokens 1..K-1
+   with far out-of-distribution ids (they route to different experts and drive
+   different KDA state), compare token 0 BITWISE. Data contamination moves
+   token 0; a shape effect cannot.
+
+     MEASURED, TP3, K = 2..6, every K:  BIT-IDENTICAL, max|d| = 0.000e+00
+   across all 163840 logits. No value belonging to any later token reaches
+   token 0. THE CONTAMINATION HYPOTHESIS IS DEAD.
+
+2. SPARKINFER_K3_AR_PAD=N pins every all-reduce to N rows regardless of the
+   live row count, zeroing the padding. ncclAllReduce is deterministic for a
+   FIXED count/communicator/topology, but its per-element cross-rank summation
+   order is a function of THE COUNT: reduce-scatter partitions the buffer, the
+   partition owner is where that element's 3-way sum starts, and which rank owns
+   a given element moves when the count moves. A K-token batch reduces width*K,
+   so token 0's elements land in a different partition for every K -- (a+b)+c
+   becomes (b+c)+a for some of them, 185 collectives per pass.
+
+     MEASURED, TP3, SPARKINFER_K3_AR_PAD=8, K = 2..6:
+       K=2..6 pos=0   cos=1.000000000  max|d|=0.000e+00  exact=100.0000%
+   Bit-identical across every K AND to the sequential single-token path.
+   Unpinned it was exact=0.0000% at every K.
+
+CONCLUSION: THE BATCHED KERNELS ARE EXACT; THE COLLECTIVE IS NOT COUNT-STABLE.
+Every bit-identity claim 0021 leans on holds -- the batched KDA q/k/v/g group,
+the expert-major regroup, moe_router_shared_kernel standing in for the register
+router at n_tok > 1, proj_f16_tok_kernel for the head. None contributes a single
+differing bit. Independently confirmed with a collective-free control:
+kimi_k3_kda_batch_check tp=1, layers 0..15, phase All, K=2..6, all bit-identical.
+
+The amplifier is the one the design doc already named (§9.2): with 896 experts
+at IQ1_S the rank-4-to-16 routing tail is a near-tie lottery, so a last-bit
+difference in a residual flips expert selection and the logits move by O(1).
+
+WHAT STILL DIFFERS UNDER THE PIN, AND WHY IT CONFIRMS THE MECHANISM. Positions
+b >= 1 remain inexact (cos 0.980-0.992) because the pin fixes the COUNT but not
+the OFFSET: token b's partial sits at row b in the batched arm and at row 0 in
+the sequential arm, so it still lands in a different partition. Token 0 is the
+one row whose offset is 0 in both arms, and it is exactly the row that goes
+bit-exact. Position b's result is now a function of b alone and no longer of K,
+which is the causal property the anomaly violated.
+
+THE PIN IS A PROBE, NOT A FIX. It costs bandwidth and does not make b >= 1
+exact. The real fix, if bit-exact speculative verification is wanted, is a
+count- and offset-invariant collective -- an allgather of each rank's partial
+plus a local sum in fixed rank order, bit-identical by construction. These
+payloads are latency-bound at 28.7 KB (attn) and 43.0 KB (moe) per token, so 3x
+the bytes may cost little; worth measuring before it is designed.
+
+======================= PART 2: MEASURING m PROPERLY =======================
+
+0021 fitted step(K) = T + m*K from 5 samples per K and reported m = 37-39 ms,
+with K=3 measuring SLOWER than K=4. Two defects in that protocol, both of which
+push directly on the slope:
+
+  CONFOUND. All reps of K=1 ran, then all of K=2, and so on, so K was perfectly
+  correlated with wall-clock time and any slow drift landed in the SLOPE rather
+  than the noise. Fixed by sweeping: one sample of every K per sweep, with the
+  starting K rotated per sweep so no K keeps a favoured slot. Rotation is by
+  sweep index, not random, because every rank must issue the identical call
+  sequence or the collectives will not match.
+
+  MEAN OF FIVE. Reported as a median now, with p25/p75/min/mean/sd printed, plus
+  se(m), a Student-t 95% CI at n-2 dof, R2, and a Theil-Sen robust cross-check.
+
+RESULT: THE NON-MONOTONICITY IS REAL, NOT NOISE. At 21 rotated sweeps the
+medians are tight (IQR 1-3 ms) and the inversions survive with DISJOINT IQRs:
+
+  K   median     p25      p75      min      (TP3, KDA_FUSE=0, PROJ_TOKS=8)
+  1   164.49   164.35   165.84   163.39
+  2   194.55   193.66   196.02   192.73
+  3   289.73   289.24   290.69   288.20
+  4   236.09   234.74   236.54   233.52     <- 54 ms FASTER than K=3
+  5   332.07   331.64   335.75   328.64
+  6   354.75   353.21   356.60   350.40
+  7   376.62   374.89   380.17   372.68
+  8   320.44   319.12   323.70   315.37     <- 56 ms FASTER than K=7
+
+step(K) IS A SAWTOOTH, NOT A LINE, so a single OLS slope over K=1..8 is not an
+estimate of marginal cost -- it reports 27-37 ms depending on which K it sees,
+and its R2 of 0.75 is measuring the sawtooth, not scatter. THAT is what the
+"m = 37 ms" number was.
+
+The low branch is K = 2, 4, 8, and it is very nearly a perfect line:
+
+  step(K) = 152.3 + 20.9*K ms      R2 = 0.9999
+  m = 20.9 ms   95% CI [18.6, 23.3]   (dof = 1; the CI is wide because n = 3,
+  the POINT estimate is not: the three independent spans give 20.40 (K=2->4),
+  21.15 (K=4->8) and 20.90 (K=2->8) ms/token, agreeing within 0.8 ms, and the
+  K=2 and K=4 medians reproduce to +-0.3 ms across four separate fleet runs.)
+
+The high branch sits a near-constant ~75 ms above that line (K=3: +74.8,
+K=5: +74.5, K=6: +76.5, K=7: +77.8), i.e. roughly one extra full pass over the
+batched projection weights.
+
+PARTIALLY EXPLAINED, AND THE REST IS STATED RATHER THAN GUESSED. A direct A/B
+on SPARKINFER_K3_PROJ_TOKS at K=8 moves step from 385.58 ms (env 4, TOKS=4,
+tok_blocks=2) to 320.44 ms (env 8, TOKS=8, tok_blocks=1) -- a 65 ms swing that
+confirms ceil(n_tok/TOKS) extra passes over the projection weights are a real
+and large cost. But widening the tile-selection rule in
+k3_proj_q8act_tok_f32/k3_proj_f16_tok_f32 so that K=3,5,6,7 also get
+tok_blocks=1 did NOT move their timings at all (rebuilt, redeployed md5-verified
+to all three ranks, re-measured: 289.73/332.07/354.75/376.62 vs
+289.51/331.67/352.70/375.46 before -- unchanged within noise). That change was
+therefore REVERTED rather than shipped, and the ~75 ms penalty at K=3,5,6,7
+remains UNEXPLAINED. It is a known-unknown in the cost model.
+
+CONSEQUENCE FOR THE GATE. m = 20.9 ms at the usable K values, against the design
+doc's "materially above ~20 ms => stop" rule (§8). The gate is met, marginally.
+Break-even acceptance m/T = 20.9/164.5 = 0.127, against the design's modelled
+0.093. But K is not freely choosable while the sawtooth stands: only
+K in {2,4,8} (drafts N in {1,3,7}) sit on the low branch, which removes the
+adaptive-N strategy §5.4 recommends. Recomputed §5.3 requirements at the three
+usable depths: 8 tok/s needs p ~ 0.50, 10 tok/s p ~ 0.65, 12 tok/s p ~ 0.77,
+15 tok/s p ~ 0.85 -- each 0.07-0.12 higher than the design's table.
+
+---
+ runtime/src/models/kimi_k3_dist_forward.cpp |  40 ++++-
+ runtime/examples/kimi_k3_dist_generate.cpp  | 210 ++++++++++++++++----
+ 2 files changed, 216 insertions(+), 34 deletions(-)
+
+--- a/runtime/src/models/kimi_k3_dist_forward.cpp
++++ b/runtime/src/models/kimi_k3_dist_forward.cpp
+@@ -80,6 +80,43 @@
+     return true;
+ }
+
++// DIAGNOSTIC PIN, OFF BY DEFAULT (SPARKINFER_K3_AR_PAD, 0 = off).
++//
++// ncclAllReduce is deterministic for a FIXED count/communicator/topology, but its
++// per-element cross-rank summation order is a function of the COUNT: the reduce-scatter
++// step partitions the buffer, the owning rank is where that element's 3-way sum starts,
++// and which rank owns a given element moves when the count moves. A K-token batch
++// reduces width*K, so token 0's elements sit in a different partition for every K --
++// re-associating (a+b)+c into (b+c)+a for some of them, 185 times per pass, with no
++// change to token 0's own data.
++//
++// Setting this to N pins every reduce to width*N rows regardless of K, so the partition
++// (and therefore token 0's summation order) is K-invariant. Rows past the live ones are
++// zeroed so the padding reduces to a defined value nothing reads. Capped at the scratch
++// cap, which is what sizes the buffers being reduced.
++int k3_ar_pad() {
++    static const int v = [] {
++        const char* e = std::getenv("SPARKINFER_K3_AR_PAD");
++        const int n = e ? std::atoi(e) : 0;
++        return n < 0 ? 0 : n;
++    }();
++    return v;
++}
++
++// Rows to reduce for a payload of `live` rows: `live` normally, the pin when it is set
++// and larger. Zeroes the padding rows it is about to add.
++int k3_ar_rows(KimiK3Forward& fwd, float* buf, int width, int live, cudaStream_t stream) {
++    const int pad = k3_ar_pad();
++    if (pad <= live) return live;
++    const int cap = kimi_k3_ffn_batch_cap(fwd);
++    const int rows = pad > cap ? cap : pad;
++    if (rows <= live) return live;
++    cudaMemsetAsync(buf + (std::size_t)width * (std::size_t)live, 0,
++                    (std::size_t)width * (std::size_t)(rows - live) * sizeof(float),
++                    stream);
++    return rows;
++}
++
+ bool allreduce_partial(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
+                        tp::dist::RankCollective& coll, cudaStream_t stream,
+                        std::string* error) {
+@@ -89,7 +126,8 @@
+         set_err(error, "partial buffer missing for allreduce");
+         return false;
+     }
+-    if (!coll.allreduce_f32(buf, (std::size_t)n,
++    const std::size_t count = (std::size_t)n * (std::size_t)k3_ar_rows(fwd, buf, n, 1, stream);
++    if (!coll.allreduce_f32(buf, count,
+                             (tp::dist::RankStreamHandle)(std::uintptr_t)stream)) {
+         set_err(error, "RankCollective::allreduce_f32 failed");
+         return false;
+@@ -577,7 +615,8 @@
+         set_err(error, "partial buffer missing for batched allreduce");
+         return false;
+     }
+-    const std::size_t count = (std::size_t)width * (std::size_t)n_tok;
++    const std::size_t count =
++        (std::size_t)width * (std::size_t)k3_ar_rows(fwd, buf, width, n_tok, stream);
+     if (!coll.allreduce_f32(buf, count,
+                             (tp::dist::RankStreamHandle)(std::uintptr_t)stream)) {
+         set_err(error, "RankCollective::allreduce_f32 failed (batched)");
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -18,6 +18,7 @@
+ #include "sparkinfer/tp/rank_protocol.h"
+ #include "sparkinfer/tp/rank_transport.h"
+
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cmath>
+@@ -219,23 +220,124 @@
+         std::fflush(stdout);
+     }
+
++    // ---- WHAT IS TOKEN 0 ALLOWED TO DEPEND ON? ----
++    //
++    // Token 0's logits move with K. Token 0 sits at the head of the batch and its correct
++    // value cannot causally depend on how many tokens follow it, so one of two things is
++    // true and they need opposite responses:
++    //
++    //   DATA  — some buffer lets tokens 1..K-1's VALUES reach token 0's computation.
++    //           Then holding K FIXED and changing only the filler tokens moves token 0.
++    //           That is a defect, and the same shape as the one this engine shipped once.
++    //   SHAPE — none of token 0's arithmetic changes, but the geometry does: grid
++    //           dimensions, kernel token-tiling, and above all the COLLECTIVE'S ELEMENT
++    //           COUNT, which is what decides NCCL's reduce-scatter partition and
++    //           therefore the order the three ranks' partials are summed in per element.
++    //           Then token 0 is BIT-IDENTICAL across fillers at fixed K, and moves only
++    //           when K moves.
++    //
++    // Compared BITWISE: under SHAPE an exact answer exists, and a tolerance would throw
++    // away the entire result. Token 0's row from the A run is kept so the K-to-K
++    // comparison is also exact rather than a cosine against the sequential arm.
++    std::vector<std::vector<float>> t0_of_K((size_t)Kmax + 1);
++    if (r0) {
++        std::printf("[spec-bench] --- token 0: data dependence vs shape dependence ---\n");
++        std::fflush(stdout);
++    }
++    for (int K = 2; K <= Kmax; ++K) {
++        std::vector<float> A(r0 ? (size_t)K * vocab : 0), B(r0 ? (size_t)K * vocab : 0);
++        std::vector<int> ia((size_t)K), ib((size_t)K);
++        for (int b = 0; b < K; ++b) ia[(size_t)b] = vtok(b);
++        // SAME token 0, deliberately far-apart fillers. Out-of-distribution ids route to
++        // different experts and drive different KDA state, which is the loudest
++        // perturbation available without changing the shape by one byte.
++        ib[0] = ia[0];
++        for (int b = 1; b < K; ++b) ib[(size_t)b] = 1000 + 37 * b;
++
++        if (!replay()) { std::fprintf(stderr, "replay failed: %s\n", err.c_str()); return 1; }
++        if (!sparkinfer::kimi_k3_dist_forward_batch(dist, coll, ia.data(), K,
++                                                    r0 ? A.data() : nullptr, &err)) {
++            std::fprintf(stderr, "filler-A batch failed: %s\n", err.c_str());
++            return 1;
++        }
++        if (!replay()) { std::fprintf(stderr, "replay failed: %s\n", err.c_str()); return 1; }
++        if (!sparkinfer::kimi_k3_dist_forward_batch(dist, coll, ib.data(), K,
++                                                    r0 ? B.data() : nullptr, &err)) {
++            std::fprintf(stderr, "filler-B batch failed: %s\n", err.c_str());
++            return 1;
++        }
++        if (!r0) continue;
++        t0_of_K[(size_t)K].assign(A.begin(), A.begin() + vocab);
++        const bool same =
++            std::memcmp(A.data(), B.data(), (size_t)vocab * sizeof(float)) == 0;
++        double maxabs = 0;
++        for (int i = 0; i < vocab; ++i) {
++            const double d = std::fabs((double)A[(size_t)i] - (double)B[(size_t)i]);
++            if (d > maxabs) maxabs = d;
++        }
++        std::printf("[spec-bench] K=%d token0 fillerA vs fillerB: %s  max|d|=%.3e\n", K,
++                    same ? "BIT-IDENTICAL (shape-only)" : "**DIFFERS (data reaches token 0)**",
++                    maxabs);
++        std::fflush(stdout);
++    }
++    if (r0 && Kmax >= 3) {
++        for (int K = 3; K <= Kmax; ++K) {
++            const bool same =
++                std::memcmp(t0_of_K[2].data(), t0_of_K[(size_t)K].data(),
++                            (size_t)vocab * sizeof(float)) == 0;
++            double maxabs = 0;
++            for (int i = 0; i < vocab; ++i) {
++                const double d = std::fabs((double)t0_of_K[2][(size_t)i] -
++                                           (double)t0_of_K[(size_t)K][(size_t)i]);
++                if (d > maxabs) maxabs = d;
++            }
++            std::printf("[spec-bench] token0 K=2 vs K=%d: %s  max|d|=%.3e\n", K,
++                        same ? "BIT-IDENTICAL" : "**DIFFERS**", maxabs);
++        }
++        std::fflush(stdout);
++    }
++
+     if (r0) {
+         std::printf("[spec-bench] --- timing: step(K) ---\n");
+         std::fflush(stdout);
+     }
+-    // Steady-state only: the first pass after a reset pays cold caches and, on rank 0,
+-    // the one-off logits reallocation. Every rank runs the same counts so the
+-    // collectives stay matched.
+-    const int warm = 2, reps = 5;
+-    std::vector<double> ms_of_K((size_t)Kmax + 1, 0.0);
+-    for (int K = 1; K <= Kmax; ++K) {
++    // ---- MEASURED SO THE SLOPE MEANS SOMETHING ----
++    //
++    // The first version of this ran all reps of K=1, then all of K=2, and so on, and
++    // averaged 5 samples. Two things were wrong with that and both push straight on m:
++    //
++    //   CONFOUND, and this is the important one. K advanced monotonically with
++    //   wall-clock time, so ANY slow drift across the timing phase -- clocks, thermals,
++    //   fabric contention -- lands in the SLOPE instead of the noise, because K was
++    //   perfectly correlated with time. That is the standard way to measure a trend
++    //   that is not there, and it is the likeliest reason K=3 came out slower than K=4
++    //   in two independent runs. Fixed by SWEEPING: one sample of every K per sweep,
++    //   with the starting K ROTATED per sweep so no K keeps a favoured slot. The
++    //   rotation is by sweep index and not random, because every rank has to issue the
++    //   identical call sequence or the collectives will not match.
++    //
++    //   MEAN OF FIVE. One straggler on any of three ranks, across 185 collectives, drags
++    //   a 5-sample mean a long way. Reported as a MEDIAN with the spread beside it, so
++    //   the reader can see whether the fit has earned any belief.
++    //
++    // State is re-anchored once per sweep, so every K within a sweep is measured at
++    // essentially the same context depth. It cannot be anchored once for the whole
++    // phase: the pass itself advances position by K.
++    const int warm_sweeps = 3;
++    int sweeps = 21;
++    if (const char* e = std::getenv("SPARKINFER_K3_SPEC_SWEEPS")) {
++        const int v = std::atoi(e);
++        if (v > 0) sweeps = v;
++    }
++    std::vector<std::vector<double>> samp((size_t)Kmax + 1);
++    std::vector<int> tids((size_t)Kmax);
++    for (int s = 0; s < warm_sweeps + sweeps; ++s) {
+         if (!replay()) { std::fprintf(stderr, "replay failed: %s\n", err.c_str()); return 1; }
+-        std::vector<int> ids((size_t)K);
+-        double best_sum = 0;
+-        for (int r = 0; r < warm + reps; ++r) {
+-            for (int b = 0; b < K; ++b) ids[(size_t)b] = vtok(r * K + b);
++        for (int j = 0; j < Kmax; ++j) {
++            const int K = 1 + ((s + j) % Kmax);
++            for (int b = 0; b < K; ++b) tids[(size_t)b] = vtok(s * Kmax + j + b);
+             const auto t0 = clock::now();
+-            if (!sparkinfer::kimi_k3_dist_forward_batch(dist, coll, ids.data(), K,
++            if (!sparkinfer::kimi_k3_dist_forward_batch(dist, coll, tids.data(), K,
+                                                         nullptr, &err)) {
+                 std::fprintf(stderr, "timed batch failed: %s\n", err.c_str());
+                 return 1;
+@@ -243,32 +345,86 @@
+             if (cudaStreamSynchronize(dist.stream) != cudaSuccess) return 1;
+             const double ms =
+                 std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+-            if (r >= warm) best_sum += ms;
+-        }
+-        ms_of_K[(size_t)K] = best_sum / reps;
+-        if (r0) {
+-            std::printf("[spec-bench] step(K=%d) = %.3f ms   (%.3f ms/token)\n", K,
+-                        ms_of_K[(size_t)K], ms_of_K[(size_t)K] / K);
+-            std::fflush(stdout);
++            if (s >= warm_sweeps) samp[(size_t)K].push_back(ms);
+         }
+     }
++    if (!r0) return 0;
+
+-    if (r0 && Kmax >= 2) {
+-        // Least-squares fit of step(K) = T + m*K over K = 1..Kmax. T is the fixed cost
+-        // of a pass and m is what one extra verified position costs -- the number the
+-        // whole speculative-decoding case rests on, and the one thing in the design
+-        // that was modelled rather than measured.
+-        double sx = 0, sy = 0, sxx = 0, sxy = 0;
++    auto pct = [](std::vector<double> v, double q) {
++        if (v.empty()) return 0.0;
++        std::sort(v.begin(), v.end());
++        const double idx = q * (double)(v.size() - 1);
++        const size_t lo = (size_t)idx;
++        const size_t hi = lo + 1 < v.size() ? lo + 1 : lo;
++        return v[lo] + (idx - (double)lo) * (v[hi] - v[lo]);
++    };
++    std::vector<double> med((size_t)Kmax + 1, 0.0);
++    std::printf("[spec-bench] %d sweeps x %d K values, rotated order, %d warm sweeps "
++                "discarded\n", sweeps, Kmax, warm_sweeps);
++    std::printf("[spec-bench]  K   median     p25      p75      min     mean      sd    n\n");
++    for (int K = 1; K <= Kmax; ++K) {
++        const std::vector<double>& v = samp[(size_t)K];
++        double mean = 0;
++        for (double x : v) mean += x;
++        mean /= (double)v.size();
++        double sd = 0;
++        for (double x : v) sd += (x - mean) * (x - mean);
++        sd = v.size() > 1 ? std::sqrt(sd / (double)(v.size() - 1)) : 0.0;
++        med[(size_t)K] = pct(v, 0.5);
++        std::printf("[spec-bench] %2d %8.2f %8.2f %8.2f %8.2f %8.2f %7.2f %4zu\n", K,
++                    med[(size_t)K], pct(v, 0.25), pct(v, 0.75), pct(v, 0.0), mean, sd,
++                    v.size());
++    }
++    int inversions = 0;
++    for (int K = 2; K <= Kmax; ++K)
++        if (med[(size_t)K] < med[(size_t)K - 1]) ++inversions;
++    std::printf("[spec-bench] monotonicity: %d inversion(s) in median step(K) "
++                "(0 = clean)\n", inversions);
++
++    if (Kmax >= 3) {
++        // OLS on the MEDIANS, with the uncertainty it deserves. se(m) is the standard
++        // error of the slope; the CI uses Student t at n-2 dof, which matters at these
++        // tiny n (t = 3.18 at dof 3, not 1.96).
+         const int n = Kmax;
++        double sx = 0, sy = 0, sxx = 0, sxy = 0;
++        for (int K = 1; K <= Kmax; ++K) {
++            sx += K; sy += med[(size_t)K];
++            sxx += (double)K * K; sxy += (double)K * med[(size_t)K];
++        }
++        const double m = ((double)n * sxy - sx * sy) / ((double)n * sxx - sx * sx);
++        const double T = (sy - m * sx) / (double)n;
++        double ss_res = 0, ss_tot = 0;
++        const double ybar = sy / (double)n;
+         for (int K = 1; K <= Kmax; ++K) {
+-            sx += K; sy += ms_of_K[(size_t)K];
+-            sxx += (double)K * K; sxy += (double)K * ms_of_K[(size_t)K];
++            const double r = med[(size_t)K] - (T + m * (double)K);
++            ss_res += r * r;
++            ss_tot += (med[(size_t)K] - ybar) * (med[(size_t)K] - ybar);
+         }
+-        const double m = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+-        const double T = (sy - m * sx) / n;
+-        std::printf("\n[spec-bench] FIT step(K) = %.2f + %.2f*K ms\n", T, m);
+-        std::printf("[spec-bench] marginal cost m = %.2f ms; break-even acceptance "
+-                    "m/step(1) = %.4f\n", m, m / ms_of_K[1]);
++        const double sxx_c = sxx - sx * sx / (double)n;
++        const double se_m =
++            n > 2 && sxx_c > 0 ? std::sqrt((ss_res / (double)(n - 2)) / sxx_c) : 0.0;
++        const double r2 = ss_tot > 0 ? 1.0 - ss_res / ss_tot : 0.0;
++        static const double tcrit[11] = {0, 12.71, 4.30, 3.18, 2.78, 2.57,
++                                         2.45, 2.36, 2.31, 2.26, 2.23};
++        const int dof = n - 2;
++        const double tc = dof >= 1 && dof <= 10 ? tcrit[dof] : 1.96;
++
++        // Theil-Sen: median of all pairwise slopes. Immune to any single bad K, so if it
++        // disagrees with OLS the OLS is being led by one point.
++        std::vector<double> slopes;
++        for (int i = 1; i <= Kmax; ++i)
++            for (int j = i + 1; j <= Kmax; ++j)
++                slopes.push_back((med[(size_t)j] - med[(size_t)i]) / (double)(j - i));
++        const double ts = pct(slopes, 0.5);
++
++        std::printf("\n[spec-bench] FIT step(K) = %.2f + %.2f*K ms   (OLS on medians)\n",
++                    T, m);
++        std::printf("[spec-bench] m = %.2f ms  se = %.2f  95%% CI [%.2f, %.2f]  "
++                    "R2 = %.4f  dof = %d\n", m, se_m, m - tc * se_m, m + tc * se_m, r2,
++                    dof);
++        std::printf("[spec-bench] Theil-Sen slope = %.2f ms (robust cross-check)\n", ts);
++        std::printf("[spec-bench] break-even acceptance m/step(1) = %.4f\n",
++                    m / med[1]);
+         std::fflush(stdout);
+     }
+     return 0;

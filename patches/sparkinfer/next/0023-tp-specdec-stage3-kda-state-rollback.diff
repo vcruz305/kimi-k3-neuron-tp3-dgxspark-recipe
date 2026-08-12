@@ -1,0 +1,878 @@
+--- a/runtime/src/models/kimi_k3.cpp
++++ b/runtime/src/models/kimi_k3.cpp
+@@ -876,6 +876,7 @@
+ }
+ 
+ void kimi_k3_free_state(KimiK3RuntimeState& s) {
++    kimi_k3_state_hist_free(s);
+     for (void* p : s.owned) cudaFree(p);
+     s.owned.clear();
+     s.conv_state_q.clear(); s.conv_state_k.clear(); s.conv_state_v.clear();
+@@ -888,6 +889,86 @@
+ }
+ 
+ // ---------------------------------------------------------------------------
++// Speculative rollback: the per-token state history ring
++// ---------------------------------------------------------------------------
++//
++// Deliberately NOT registered in state.owned. That vector is freed by
++// kimi_k3_free_state, and the ring has its own lifetime: a caller sweeping K reallocates
++// it without touching the recurrent state it shadows.
++
++void kimi_k3_state_hist_free(KimiK3RuntimeState& s) {
++    if (s.delta_hist)  cudaFree(s.delta_hist);
++    if (s.conv_q_hist) cudaFree(s.conv_q_hist);
++    if (s.conv_k_hist) cudaFree(s.conv_k_hist);
++    if (s.conv_v_hist) cudaFree(s.conv_v_hist);
++    s.delta_hist = s.conv_q_hist = s.conv_k_hist = s.conv_v_hist = nullptr;
++    s.hist_depth = 0;
++    s.hist_save_n = 0;
++    s.hist_saved = 0;
++}
++
++bool kimi_k3_state_hist_alloc(KimiK3RuntimeState& s, int depth) {
++    if (depth <= 0) { kimi_k3_state_hist_free(s); return true; }
++    if (s.hist_depth >= depth) return true;
++    kimi_k3_state_hist_free(s);
++    // A stage owning no KDA layer has no recurrent state to roll back. Reporting success
++    // with a null ring is right: hist_save_n stays 0, the scan never fires, and a
++    // rollback on this stage is a legal no-op rather than an error the caller must
++    // special-case per rank.
++    if (s.n_kda_owned <= 0) return true;
++
++    const size_t slots = (size_t)s.n_kda_owned;
++    const size_t d_bytes = (size_t)depth * slots * (size_t)s.delta_state_elems * sizeof(float);
++    const size_t c_bytes = (size_t)depth * slots * (size_t)s.conv_state_elems * sizeof(float);
++    if (d_bytes == 0 || c_bytes == 0) return false;
++    if (cudaMalloc(&s.delta_hist, d_bytes) != cudaSuccess ||
++        cudaMalloc(&s.conv_q_hist, c_bytes) != cudaSuccess ||
++        cudaMalloc(&s.conv_k_hist, c_bytes) != cudaSuccess ||
++        cudaMalloc(&s.conv_v_hist, c_bytes) != cudaSuccess) {
++        kimi_k3_state_hist_free(s);
++        return false;
++    }
++    s.hist_depth = depth;
++    return true;
++}
++
++bool kimi_k3_state_rollback(KimiK3RuntimeState& s, int j, cudaStream_t stream) {
++    if (j < 0 || j > s.hist_saved) return false;
++    // Accept-everything. The live state already IS the boundary after token hist_saved,
++    // which is why the pass never spent bandwidth saving it.
++    if (j == s.hist_saved) return true;
++    if (s.n_kda_owned <= 0) return true;
++    if (!s.delta_hist || !s.conv_q_hist || !s.conv_k_hist || !s.conv_v_hist) return false;
++
++    const size_t slots  = (size_t)s.n_kda_owned;
++    const size_t d_span = slots * (size_t)s.delta_state_elems;
++    const size_t c_span = slots * (size_t)s.conv_state_elems;
++    const size_t jb = (size_t)j;
++
++    // FOUR memcpys for the whole model's recurrent state, which is the entire reason
++    // Stage 0b made these arenas contiguous — the scattered layout this replaced would
++    // have made a restore 276 launches against a ~1.7 us floor.
++    //
++    // All four or none: restoring delta_state while leaving the conv window ahead of it
++    // convolves the next token over the wrong 4-deep window. That output stays fluent,
++    // which is precisely why kimi_k3_reset_state has always treated the four as one unit.
++    if (cudaMemcpyAsync(s.delta_arena, s.delta_hist + jb * d_span,
++                        d_span * sizeof(float), cudaMemcpyDeviceToDevice,
++                        stream) != cudaSuccess ||
++        cudaMemcpyAsync(s.conv_q_arena, s.conv_q_hist + jb * c_span,
++                        c_span * sizeof(float), cudaMemcpyDeviceToDevice,
++                        stream) != cudaSuccess ||
++        cudaMemcpyAsync(s.conv_k_arena, s.conv_k_hist + jb * c_span,
++                        c_span * sizeof(float), cudaMemcpyDeviceToDevice,
++                        stream) != cudaSuccess ||
++        cudaMemcpyAsync(s.conv_v_arena, s.conv_v_hist + jb * c_span,
++                        c_span * sizeof(float), cudaMemcpyDeviceToDevice,
++                        stream) != cudaSuccess)
++        return false;
++    return true;
++}
++
++// ---------------------------------------------------------------------------
+ // Scratch
+ // ---------------------------------------------------------------------------
+ 
+@@ -2855,6 +2936,45 @@
+             }
+             if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
+ 
++            // ---- SPECULATIVE ROLLBACK SNAPSHOT ----
++            //
++            // THIS LINE IS THE ONLY CORRECT PLACE FOR IT, and both neighbours are wrong.
++            // Only here do all four buffers describe the same boundary: the three conv
++            // windows were shifted at the top of this iteration and the delta rule was
++            // applied immediately above. One iteration later the conv window has already
++            // eaten token b+1 while delta has not, and a restore from that slot would
++            // convolve the next token over a window a token ahead of its own state —
++            // fluent output, silently wrong, the failure mode this engine has shipped
++            // before. After the loop closes, only the final boundary still exists, and
++            // that is the one snapshot no caller needs.
++            //
++            // The destination slot comes from the live pointer's OFFSET INTO ITS ARENA,
++            // never from kda_ord. Arena slots are packed densely over the layers THIS
++            // STAGE OWNS; kda_ord is a global ordinal and on a pipeline stage the two do
++            // not match. Reading the offset back from the pointer keeps one source of
++            // truth instead of a second copy of the packing rule.
++            if (b < st.hist_save_n && st.delta_hist && st.n_kda_owned > 0) {
++                const size_t slots  = (size_t)st.n_kda_owned;
++                const size_t d_elem = (size_t)st.delta_state_elems;
++                const size_t c_elem = (size_t)st.conv_state_elems;
++                const size_t d_off  = (size_t)(st.delta_state[kda_ord]  - st.delta_arena);
++                const size_t c_off  = (size_t)(st.conv_state_q[kda_ord] - st.conv_q_arena);
++                const size_t bb     = (size_t)b;
++                if (cudaMemcpyAsync(st.delta_hist + bb * slots * d_elem + d_off,
++                                    st.delta_state[kda_ord], d_elem * sizeof(float),
++                                    cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
++                    cudaMemcpyAsync(st.conv_q_hist + bb * slots * c_elem + c_off,
++                                    st.conv_state_q[kda_ord], c_elem * sizeof(float),
++                                    cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
++                    cudaMemcpyAsync(st.conv_k_hist + bb * slots * c_elem + c_off,
++                                    st.conv_state_k[kda_ord], c_elem * sizeof(float),
++                                    cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
++                    cudaMemcpyAsync(st.conv_v_hist + bb * slots * c_elem + c_off,
++                                    st.conv_state_v[kda_ord], c_elem * sizeof(float),
++                                    cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
++                    return false;
++            }
++
+             // Already computed above when the q/k/v/g fusion took the fast path, and
+             // by the chunk arm whenever a_tok > 1 — so this is a single-token fallback
+             // and `gproj_b` is s.g_proj_out with b == 0.
+--- a/runtime/src/models/kimi_k3_dist_forward.cpp
++++ b/runtime/src/models/kimi_k3_dist_forward.cpp
+@@ -287,6 +287,11 @@
+     long n_attn_ar = 0, n_moe_ar = 0;
+ 
+     rank.state.n_ckpt = 0;
++    // A single token consumed here moves the recurrent state past every boundary the last
++    // verify pass snapshotted, so those snapshots no longer describe any state this rank
++    // can return to. Dropping the batch here is what makes "rollback after continuing"
++    // an error instead of a restore that quietly undoes tokens already emitted.
++    rank.batch_n_tok = 0;
+ 
+     // Debug localization: forward-call index, so per-token dumps do not
+     // overwrite each other and a specific prompt position can be compared.
+@@ -692,6 +697,27 @@
+     rank.state.n_ckpt = 0;
+     fwd.debug = nullptr;
+ 
++    // n_tok-1 slots, not n_tok. The boundary after the LAST token is the live state the
++    // pass ends on, so saving it would buy a copy of something already in place — and it
++    // is the "accept everything" case, the one a good drafter hits most often.
++    if (rank.rollback_enable) {
++        if (!kimi_k3_state_hist_alloc(rank.state, n_tok > 1 ? n_tok - 1 : 0)) {
++            set_err(error, "dist_forward_batch: state history ring cudaMalloc failed");
++            return false;
++        }
++        rank.state.hist_save_n = n_tok - 1;
++    } else {
++        rank.state.hist_save_n = 0;
++    }
++    rank.state.hist_saved = 0;
++    // Invalidate the previous batch BEFORE this one can fail. Left set, a pass that
++    // returned an error partway through would still look rollback-able: a caller that
++    // ignored the false return and asked for j == old_n_tok-1 would take the "nothing was
++    // rejected" arm, copy nothing, and set the position from a base that belongs to a
++    // different batch. Silent, and wrong in the direction this engine has been wrong
++    // before. forward_batch re-arms it only on success.
++    rank.batch_n_tok = 0;
++
+     float* x  = rank.xb;
+     float* xn = rank.xb_next;
+     for (int b = 0; b < n_tok; ++b) {
+@@ -718,9 +744,17 @@
+     // returns below. state.d_pos and state.res_bank are owned by kimi_k3_alloc_state
+     // and freed through it; leaving either pointing into the batch scratch would free
+     // the wrong allocation at teardown.
++    //
++    // hist_save_n is cleared here too, and it has to be on the ERROR paths as much as the
++    // success one: it is read by the scan loop of every caller of the phase entry point,
++    // so a value left behind by a failed batch would make the next single-token decode or
++    // prefill chunk snapshot into a ring sized for a batch it is not running.
+     struct Restore {
+         KimiK3DistRank& r; int* dp; float* bk; int pos;
+-        ~Restore() { r.state.d_pos = dp; r.state.res_bank = bk; r.state.position = pos; }
++        ~Restore() {
++            r.state.d_pos = dp; r.state.res_bank = bk; r.state.position = pos;
++            r.state.hist_save_n = 0;
++        }
+     } restore{rank, base_d_pos, base_bank, base_pos};
+ 
+     for (int layer = 0; layer < cfg.n_layers; ++layer) {
+@@ -819,6 +853,12 @@
+         }
+     }
+ 
++    // Only now, after every path that can fail has passed: hist_saved is what bounds a
++    // legal rollback, and a pass that returned early wrote fewer slots than it planned to.
++    rank.state.hist_saved = rank.state.hist_save_n;
++    rank.batch_base_pos = base_pos;
++    rank.batch_n_tok = n_tok;
++
+     // The pass consumed all n_tok tokens, so the position advances by the whole batch.
+     // ~Restore puts back base_pos first; this is written after it on purpose — the
+     // destructor runs at return, so the value set here is what the next call sees.
+@@ -839,6 +879,88 @@
+     return true;
+ }
+ 
++bool kimi_k3_dist_set_rollback(KimiK3DistRank& rank, bool on) {
++    rank.rollback_enable = on;
++    if (!on) kimi_k3_state_hist_free(rank.state);
++    return true;
++}
++
++bool kimi_k3_dist_forward_rollback(KimiK3DistRank& rank, int j, std::string* error) {
++    if (!rank.loaded || !rank.stream) {
++        set_err(error, "dist_forward_rollback: rank not loaded");
++        return false;
++    }
++    if (rank.batch_n_tok < 1) {
++        set_err(error, "dist_forward_rollback: no batch to roll back");
++        return false;
++    }
++    if (j < 0 || j >= rank.batch_n_tok) {
++        set_err(error, "dist_forward_rollback: j " + std::to_string(j) +
++                           " outside [0," + std::to_string(rank.batch_n_tok - 1) + "]");
++        return false;
++    }
++    if (cudaSetDevice(rank.device) != cudaSuccess) {
++        set_err(error, "cudaSetDevice failed");
++        return false;
++    }
++
++    // ---- THE RECURRENT STATE ----
++    //
++    // TWO WAYS A j CAN BE SERVED, AND THE GAP BETWEEN THEM IS A SILENT-WRONG-ANSWER TRAP.
++    //
++    //   live     — j is the last token of the batch. Nothing was rejected, the state
++    //              already sits on that boundary, and there is nothing to copy.
++    //   snapshot — the ring holds the boundary after token j.
++    //
++    // These are mutually exclusive (the ring saves n_tok-1 slots, indices 0..n_tok-2) and
++    // together they are the whole legal range ONLY when the ring was on. With the ring off
++    // hist_saved is 0, and a real rejection matches neither arm: it must be REFUSED. The
++    // tempting shape here is "no snapshot, so do nothing and return true", which leaves
++    // the recurrent state holding every rejected draft and emits fluent, wrong text with
++    // no diagnostic anywhere.
++    const bool live_boundary = (j == rank.batch_n_tok - 1);
++    const bool have_snapshot = (j < rank.state.hist_saved);
++    if (!live_boundary && !have_snapshot) {
++        set_err(error, "dist_forward_rollback: no snapshot for j " + std::to_string(j) +
++                           " of " + std::to_string(rank.batch_n_tok) + " (ring saved " +
++                           std::to_string(rank.state.hist_saved) +
++                           "; was kimi_k3_dist_set_rollback called before the batch?)");
++        return false;
++    }
++    if (have_snapshot && !kimi_k3_state_rollback(rank.state, j, rank.stream)) {
++        set_err(error, "kimi_k3_state_rollback failed at j " + std::to_string(j));
++        return false;
++    }
++
++    // ---- THE POSITION, AND WITH IT THE MLA KV CACHE ----
++    //
++    // Accepting j means tokens 0..j were consumed, so the next free position is
++    // base + j + 1. That single scalar IS the KV rollback: every attention kernel lengths
++    // its walk from its own *d_pos + 1, so the rows the rejected tokens wrote sit beyond
++    // the walk, are never read, and are overwritten by the next pass. No buffer work.
++    //
++    // Both mirrors move together. Advancing only the host side leaves the kernels
++    // attending over a stale length — fast and wrong, the exact drift
++    // kimi_k3_check_pos_sync exists to catch.
++    const int next_pos = rank.batch_base_pos + j + 1;
++    rank.state.position = next_pos;
++    if (cudaMemcpyAsync(rank.state.d_pos, &next_pos, sizeof(int), cudaMemcpyHostToDevice,
++                        rank.stream) != cudaSuccess) {
++        set_err(error, "dist_forward_rollback: d_pos H2D failed");
++        return false;
++    }
++    if (cudaStreamSynchronize(rank.stream) != cudaSuccess) {
++        set_err(error, "dist_forward_rollback: stream sync failed");
++        return false;
++    }
++
++    // The batch is spent. Leaving batch_n_tok set would let a second rollback restore a
++    // snapshot taken before the continuation tokens this rank has since consumed.
++    rank.batch_n_tok = 0;
++    rank.state.hist_saved = 0;
++    return true;
++}
++
+ bool kimi_k3_dist_forward_prompt(KimiK3DistRank& rank,
+                                  tp::dist::RankCollective& coll,
+                                  const int* ids,
+--- a/runtime/include/sparkinfer/models/kimi_k3.h
++++ b/runtime/include/sparkinfer/models/kimi_k3.h
+@@ -321,6 +321,47 @@
+     float* delta_arena  = nullptr;
+     int    n_kda_owned  = 0;
+ 
++    // ---- SPECULATIVE ROLLBACK: THE PER-TOKEN STATE HISTORY RING ----
++    //
++    // A K-token verify pass consumes all K tokens, but the caller may accept only a
++    // prefix of them. To continue from "having consumed exactly j+1 of them" the four
++    // recurrent buffers must go back to their value at that boundary. Nothing else has
++    // to: the residual bank is intra-token scratch rebuilt every forward call, and the
++    // MLA KV cache is rolled back by moving `position` alone, because every attention
++    // kernel lengths its walk from its OWN *d_pos + 1 and so never reads the rows a
++    // rejected token wrote (the next pass overwrites them).
++    //
++    // TOKEN-MAJOR — [depth][n_kda_owned][elems] — and the axis order is the whole point.
++    // A restore is the hot, latency-visible half (it sits between the verify pass and the
++    // next token) and token-major makes it FOUR contiguous memcpys of a whole arena. The
++    // save is the cold half and is a per-layer slot copy either way, because the scan is
++    // nested layer-outer/token-inner: at the instant layer L consumes token b, layers
++    // below L have already consumed all K and layers above have consumed none. There is
++    // no instant at which the whole model's state sits at token b, which is exactly why
++    // the ring is filled one slot at a time from inside the scan and cannot be a single
++    // bulk copy taken between tokens.
++    //
++    // WHAT THE SNAPSHOT IS, AND WHAT IT IS NOT. hist[b] is the state THIS PASS computed
++    // after consuming token b. It is deliberately NOT an attempt to reproduce the state a
++    // pure sequential run would have reached: the NCCL all-reduce's summation order
++    // depends on its element count, that count is width*n_tok, and so a K-token pass and
++    // a sequential run legitimately differ in the low bits of every activation and hence
++    // of the state itself. Restoring hist[b] keeps the state consistent with the logits
++    // that were used to accept those tokens, which is the property accept/reject needs;
++    // matching an alternate execution that never ran is neither achievable here nor
++    // required. See kimi_k3_state_rollback.
++    float* delta_hist  = nullptr;   // [hist_depth][n_kda_owned][delta_state_elems]
++    float* conv_q_hist = nullptr;   // [hist_depth][n_kda_owned][conv_state_elems]
++    float* conv_k_hist = nullptr;
++    float* conv_v_hist = nullptr;
++    int    hist_depth  = 0;   // slots allocated
++    // How many leading tokens the CURRENT pass must snapshot. Zero disables the save
++    // entirely, which is what every non-speculative caller leaves it at — the single
++    // token path, the chunked prefill driver and an unrolled-back verify all pay nothing.
++    int    hist_save_n = 0;
++    // How many slots the LAST completed pass actually wrote. Bounds a legal rollback.
++    int    hist_saved  = 0;
++
+     // Indexed by MLA-layer ordinal (0..n_mla_layers-1).
+     //
+     // Element type is f16 when kv_f16 is set (the default — llama.cpp's own
+@@ -364,6 +405,28 @@
+ void kimi_k3_reset_state(KimiK3RuntimeState& s);   // zero everything, position=0, n_ckpt=0
+ void kimi_k3_free_state(KimiK3RuntimeState& s);
+ 
++// ---- SPECULATIVE ROLLBACK ----
++//
++// Size the history ring to `depth` snapshot slots. Grows monotonically; a smaller depth
++// is honoured from the existing allocation. depth == 0 frees it. Costs
++// depth * (delta + 3*conv) bytes for the layers THIS rank owns — ~148 MB per slot at
++// TP3 on the full model, so K=8 (depth 7) is ~1.0 GB against ~10 GB free.
++bool kimi_k3_state_hist_alloc(KimiK3RuntimeState& s, int depth);
++void kimi_k3_state_hist_free(KimiK3RuntimeState& s);
++
++// Restore the recurrent state to its value after the last pass consumed token `j`.
++//
++// Legal j is [0, s.hist_saved]. j == s.hist_saved is the NO-OP case and is not an error:
++// a pass over n_tok tokens saves n_tok-1 slots because the final boundary is the live
++// state itself, so "accept everything" costs nothing. j > s.hist_saved is a caller bug
++// (asking for a boundary the pass never reached) and returns false.
++//
++// Rolls back the KDA delta and conv state ONLY. The caller still owns the position — it
++// must set it to (the pass's base position) + j + 1, which is what returns the MLA KV
++// cache to a correct state as well. Doing one without the other leaves the conv window
++// and the attention length disagreeing, which stays fluent and is silently wrong.
++bool kimi_k3_state_rollback(KimiK3RuntimeState& s, int j, cudaStream_t stream);
++
+ // Map a global layer index to its ordinal within its own type (KDA or MLA), so
+ // per-type state vectors can be indexed contiguously rather than one slot per
+ // layer with most of them unused.
+--- a/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
++++ b/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
+@@ -43,6 +43,22 @@
+     int*   pos_vec = nullptr;   // [batch_cap], token b's position at pos_vec[b]
+     float* bank_b = nullptr;    // [batch_cap, max_ckpt * hidden]
+     int    batch_cap = 0;
++
++    // ---- SPECULATIVE ROLLBACK ----
++    //
++    // Off by default, and that is not caution — it is what keeps the Stage 2 marginal
++    // cost measurement meaning what it says. Snapshotting costs real bandwidth
++    // (~148 MB/rank per saved position at TP3), so a verify pass that is never rolled
++    // back must not pay for it, and an m fitted with the ring silently on would not be
++    // the m the design's break-even was derived from. A/B-ing the ring's own cost is
++    // then just this flag.
++    bool rollback_enable = false;
++
++    // What the LAST kimi_k3_dist_forward_batch consumed. The rollback needs the base
++    // position to restore `position` to base + j + 1, and it cannot be recovered after
++    // the fact: by then state.position has already advanced by the whole batch.
++    int batch_base_pos = 0;
++    int batch_n_tok = 0;
+ };
+ 
+ struct KimiK3DistRankLoadOptions {
+--- a/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h
++++ b/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h
+@@ -39,11 +39,11 @@
+ // is what a speculative verify pass needs: 92.9% of a decode token's bytes are dense
+ // and amortise perfectly here, and the 185 all-reduces per token become 185 per pass.
+ //
+-// NO DRAFTING AND NO ROLLBACK. This runs the tokens it is given and leaves the
+-// recurrent state having consumed all n_tok of them. It exists to prove batched
+-// verification is correct and to measure what an extra verified position costs; a
+-// caller that wants to reject a suffix needs the state snapshot/restore that does not
+-// exist yet, and must not use this to speculate until it does.
++// NO DRAFTING. This runs the tokens it is given and leaves the recurrent state having
++// consumed all n_tok of them. A caller that wants to reject a suffix must first enable
++// the state history ring (kimi_k3_dist_set_rollback) and then call
++// kimi_k3_dist_forward_rollback; without the ring this entry point cannot be used to
++// speculate, because the rejected tokens' state updates are unrecoverable.
+ //
+ // out_logits_host, on rank 0, is [n_tok, vocab] ROW-MAJOR — token b's logits at
+ // (out_logits_host + b*vocab). Workers pass nullptr. Both are the same contract as
+@@ -59,6 +59,39 @@
+                                 float* out_logits_host,
+                                 std::string* error = nullptr);
+ 
++// ---------------------------------------------------------------------------
++// ROLLBACK AFTER A PARTIALLY-ACCEPTED VERIFY PASS
++// ---------------------------------------------------------------------------
++//
++// Turn the state history ring on before calling forward_batch. Off by default so a
++// verify pass that will never be rolled back does not pay ~148 MB/rank per saved
++// position, and so the Stage 2 marginal-cost measurement stays comparable.
++// Allocation is lazy and happens inside forward_batch.
++bool kimi_k3_dist_set_rollback(KimiK3DistRank& rank, bool on);
++
++// Return the rank to "having consumed exactly j+1 of the last batch's tokens", so the
++// next kimi_k3_dist_forward_token continues the accepted history. Legal j is
++// [0, batch_n_tok - 1]; j == batch_n_tok - 1 accepted everything and costs nothing.
++//
++// WHAT THIS DOES AND DOES NOT GUARANTEE — read before using it to speculate.
++//
++// It restores the state THAT PASS COMPUTED after token j: the same state that produced
++// the logits row j the caller just used to make its accept decision. It does NOT
++// reproduce the state a pure sequential decode would have reached, and cannot: the NCCL
++// all-reduce's summation order depends on its element count, that count is width*n_tok,
++// so a K-token pass and a sequential run differ in the low bits of every activation and
++// therefore of the state. That difference is real and is NOT a defect here.
++//
++// What greedy accept/reject actually needs is not losslessness but CAUSALITY: that row
++// j's logits and token j's state do not depend on the drafts at positions > j. Given
++// that, every emitted token is the argmax of logits computed from its true accepted
++// prefix, so the emitted text is a valid greedy trajectory — it is simply not
++// bit-identical to the trajectory the non-batched path would have taken, in the same way
++// and for the same reason this engine is already not bit-identical to the reference.
++// Making the two match needs a count-invariant collective, which is a separate piece of
++// work and is not required for this to be correct.
++bool kimi_k3_dist_forward_rollback(KimiK3DistRank& rank, int j, std::string* error = nullptr);
++
+ // Prefill: run each prompt id through dist_forward_token; keep only final logits
+ // on rank 0 (same contract as kimi_k3_generate pipeline prefill).
+ bool kimi_k3_dist_forward_prompt(KimiK3DistRank& rank,
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -52,8 +52,12 @@
+                  "          [--prompts-file F]   # multi-prompt: one CSV id-line per prompt; load once\n"
+                  "          [--n-predict N] [--max-ctx N] [--device 0]\n"
+                  "          [--session-id N] [--dry-protocol]\n"
++                 "          [--spec-bench K]     # batched-verify fidelity + step(K) cost\n"
++                 "          [--spec-rollback K] [--spec-cont N]   # Stage 3 rollback gates\n"
+                  "\n"
+-                 "  KV reset sentinel token id = -2 (broadcast between multi-prompts).\n",
++                 "  KV reset sentinel token id = -2 (broadcast between multi-prompts).\n"
++                 "  --spec-bench and --spec-rollback exchange no control messages, so\n"
++                 "  EVERY rank must be given the SAME flag and the SAME --prompt-ids.\n",
+                  argv0);
+ }
+ 
+@@ -141,6 +145,12 @@
+ //   2. What does an extra verified position cost? step(K) for K = 1..Kmax, from which
+ //      the marginal cost m is fitted. Everything downstream of this stage depends on
+ //      that number.
++// Stage 3 rollback gates. Same no-control-messages contract as run_spec_bench, so it
++// dispatches through the same two call sites. Defined in kimi_k3_spec_rollback_check.cpp.
++int run_spec_rollback_check(sparkinfer::KimiK3DistRank& dist,
++                            sparkinfer::tp::dist::RankCollective& coll,
++                            const std::vector<int>& prompt, int Kmax, int n_cont);
++
+ static int run_spec_bench(sparkinfer::KimiK3DistRank& dist,
+                           sparkinfer::tp::dist::RankCollective& coll,
+                           const std::vector<int>& prompt, int Kmax) {
+@@ -436,6 +446,8 @@
+     std::string model, listen, coord, prompt_csv, prompt_file, prompts_file;
+     bool dry_protocol = false;
+     int spec_bench = 0;   // --spec-bench K: batched-verify correctness + step(K) timing
++    int spec_rollback = 0;   // --spec-rollback K: Stage 3 state-rollback gates
++    int spec_cont = 3;       // --spec-cont N: continuation steps the rollback check runs
+ 
+     for (int i = 1; i < argc; ++i) {
+         auto need = [&](const char* flag) -> const char* {
+@@ -462,6 +474,9 @@
+             session_id = (std::uint64_t)std::strtoull(need("--session-id"), nullptr, 10);
+         else if (!std::strcmp(argv[i], "--dry-protocol")) dry_protocol = true;
+         else if (!std::strcmp(argv[i], "--spec-bench")) spec_bench = std::atoi(need("--spec-bench"));
++        else if (!std::strcmp(argv[i], "--spec-rollback"))
++            spec_rollback = std::atoi(need("--spec-rollback"));
++        else if (!std::strcmp(argv[i], "--spec-cont")) spec_cont = std::atoi(need("--spec-cont"));
+         else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
+             usage(argv[0]);
+             return 0;
+@@ -628,6 +643,13 @@
+             kimi_k3_dist_rank_free(&dist);
+             return rc;
+         }
++        if (spec_rollback > 0) {
++            const int rc = run_spec_rollback_check(dist, *coll, prompts[0], spec_rollback,
++                                                   spec_cont);
++            ctr.finish(nullptr);
++            kimi_k3_dist_rank_free(&dist);
++            return rc;
++        }
+ 
+         std::vector<float> logits((size_t)dist.cfg.vocab);
+ 
+@@ -812,16 +834,19 @@
+     // about to enter and every rank would hang in NCCL. Both sides key off the same
+     // flag, and the launcher must pass the same --prompt-ids to every rank because the
+     // verify tokens are derived from it locally.
+-    if (spec_bench > 0) {
++    if (spec_bench > 0 || spec_rollback > 0) {
+         std::vector<int> bench_prompt = prompt_csv.empty()
+             ? (prompt_file.empty() ? std::vector<int>() : load_ids_file(prompt_file))
+             : parse_ids_csv(prompt_csv);
+         if (bench_prompt.empty()) {
+             std::fprintf(stderr,
+-                         "--spec-bench needs the SAME --prompt-ids on every rank\n");
++                         "--spec-bench/--spec-rollback need the SAME --prompt-ids on "
++                         "every rank\n");
+             return 2;
+         }
+-        const int rc = run_spec_bench(dist, *coll, bench_prompt, spec_bench);
++        const int rc = spec_bench > 0
++            ? run_spec_bench(dist, *coll, bench_prompt, spec_bench)
++            : run_spec_rollback_check(dist, *coll, bench_prompt, spec_rollback, spec_cont);
+         kimi_k3_dist_rank_free(&dist);
+         return rc;
+     }
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -164,7 +164,8 @@
+     set_target_properties(kimi_k3_tp_bench PROPERTIES CXX_STANDARD 17)
+ 
+     # End-to-end TP decode vs single-GPU decode.
+-        add_executable(kimi_k3_dist_generate examples/kimi_k3_dist_generate.cpp)
++        add_executable(kimi_k3_dist_generate examples/kimi_k3_dist_generate.cpp
++                                             examples/kimi_k3_spec_rollback_check.cpp)
+     target_link_libraries(kimi_k3_dist_generate PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
+     set_target_properties(kimi_k3_dist_generate PROPERTIES CXX_STANDARD 17)
+ 
+--- a/runtime/examples/kimi_k3_spec_rollback_check.cpp
++++ b/runtime/examples/kimi_k3_spec_rollback_check.cpp
+@@ -0,0 +1,309 @@
++// Stage 3 equivalence check: KDA state rollback after a partially-accepted verify pass.
++//
++// ---------------------------------------------------------------------------
++// WHAT CORRECTNESS MEANS HERE, AND WHY IT IS NOT "MATCHES SEQUENTIAL DECODE"
++// ---------------------------------------------------------------------------
++//
++// The obvious gate — roll back to j, continue, and demand the floats match what a pure
++// sequential decode would have produced — CANNOT PASS ON THIS ENGINE, and failing it
++// would not mean the rollback is broken.
++//
++// ncclAllReduce is deterministic for a fixed element count, but its reduce-scatter
++// partitioning, and therefore the order the three ranks' partials are summed in, depends
++// on that count. The count is width * n_tok. So a K-token verify pass and a sequential
++// run legitimately differ in the low bits of every activation — and because the KDA state
++// is updated from those same activations, they differ in the STATE too, not just the
++// logits. A snapshot taken inside a K=5 batch is not the state a sequential run would
++// have reached at that position, and no amount of correct copying will make it one.
++//
++// So what does greedy accept/reject actually need? Not losslessness. CAUSALITY:
++//
++//   (C1) SUFFIX INDEPENDENCE — logits row j and the state after token j must not depend
++//        on the drafts at positions > j. They may depend on K.
++//   (C2) SNAPSHOT CONSISTENCY — rollback(j) must restore the state THAT PASS computed
++//        after token j: the same state that produced the row-j logits the caller used to
++//        make its accept decision.
++//
++// Given C1 and C2, every emitted token is the argmax of logits computed from its true
++// accepted prefix, so the emitted text is a valid greedy trajectory. It is simply not the
++// same trajectory the non-batched path takes — in exactly the way, and for exactly the
++// reason, this engine already diverges from the reference implementation. Restoring a
++// hypothetical "pure sequential" state would in fact be WORSE than the snapshot: it would
++// splice a state that never produced the logits the accept decision was made from.
++//
++// Tests A and C below are hard gates on C1 and C2 and are compared BITWISE, because under
++// C1 an exact answer exists and a tolerance would throw the whole result away. Test D
++// measures the gap to sequential decode and is reported, never asserted — it quantifies
++// what NOT having a count-invariant collective costs, which is a Stage 4 planning input
++// rather than a Stage 3 defect.
++
++#include "sparkinfer/models/kimi_k3.h"
++#include "sparkinfer/models/kimi_k3_dist_forward.h"
++#include "sparkinfer/models/kimi_k3_dist_rank.h"
++#include "sparkinfer/tp/rank_collective.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace {
++
++// Deterministic on every rank from data every rank already has. The check sends no
++// control messages and derives nothing from logits (which only rank 0 holds), so all
++// ranks issue an identical sequence of collectives and stay in lockstep without the
++// K-token protocol change that belongs to Stage 4.
++int cyc(const std::vector<int>& p, int i) {
++    return p[(size_t)(i % (int)p.size())];
++}
++
++struct Cmp {
++    double cos = 0, maxabs = 0;
++    double exact_pct = 0;
++    int top_a = 0, top_b = 0;
++    bool bitwise = false;
++};
++
++Cmp compare_rows(const float* a, const float* b, int n) {
++    Cmp c;
++    double dot = 0, na = 0, nb = 0;
++    size_t n_exact = 0;
++    for (int i = 0; i < n; ++i) {
++        dot += (double)a[i] * (double)b[i];
++        na += (double)a[i] * (double)a[i];
++        nb += (double)b[i] * (double)b[i];
++        const double d = std::fabs((double)a[i] - (double)b[i]);
++        if (d > c.maxabs) c.maxabs = d;
++        if (std::memcmp(&a[i], &b[i], sizeof(float)) == 0) ++n_exact;
++        if (a[i] > a[c.top_a]) c.top_a = i;
++        if (b[i] > b[c.top_b]) c.top_b = i;
++    }
++    c.cos = dot / (std::sqrt(na) * std::sqrt(nb) + 1e-30);
++    c.exact_pct = 100.0 * (double)n_exact / (double)n;
++    c.bitwise = (n_exact == (size_t)n);
++    return c;
++}
++
++}  // namespace
++
++// Returns 0 on pass, 1 on a hard-gate failure.
++int run_spec_rollback_check(sparkinfer::KimiK3DistRank& dist,
++                            sparkinfer::tp::dist::RankCollective& coll,
++                            const std::vector<int>& prompt, int Kmax, int n_cont) {
++    using namespace sparkinfer;
++    const int rank_id = dist.plan.spec.rank;
++    const int vocab = dist.cfg.vocab;
++    const bool r0 = (rank_id == 0);
++    std::string err;
++    int failures = 0;
++
++    auto replay = [&]() -> bool {
++        kimi_k3_reset_state(dist.state);
++        if (cudaStreamSynchronize(dist.stream) != cudaSuccess) return false;
++        for (size_t i = 0; i < prompt.size(); ++i)
++            if (!kimi_k3_dist_forward_token(dist, coll, prompt[i], nullptr, &err))
++                return false;
++        return true;
++    };
++
++    // The forced continuation. FIXED rather than greedy-fed, and that is what keeps the
++    // arms comparable: feeding back an argmax would need rank 0 to tell the workers which
++    // token it picked, which is the protocol change Stage 4 owns. With the inputs pinned,
++    // any difference between two arms is a difference in STATE, which is the thing under
++    // test. The ids are far from the prompt's own so the continuation exercises different
++    // experts than the drafts did.
++    auto cont_tok = [&](int s) { return 4096 + 101 * (s + 1); };
++
++    // Run `n_cont` forced continuation steps and collect their logits on rank 0.
++    auto continue_and_capture = [&](std::vector<float>& out) -> bool {
++        out.assign(r0 ? (size_t)n_cont * vocab : 0, 0.0f);
++        for (int s = 0; s < n_cont; ++s)
++            if (!kimi_k3_dist_forward_token(dist, coll, cont_tok(s),
++                                            r0 ? out.data() + (size_t)s * vocab : nullptr,
++                                            &err))
++                return false;
++        return true;
++    };
++
++    if (r0) {
++        std::printf("\n[spec-rollback] prompt=%zu tokens, Kmax=%d, continuation=%d steps,"
++                    " vocab=%d\n", prompt.size(), Kmax, n_cont, vocab);
++        std::fflush(stdout);
++    }
++
++    // -----------------------------------------------------------------------
++    // TEST C — THE RING IS INERT
++    // -----------------------------------------------------------------------
++    // Enabling snapshots must not change the pass's own output by one bit. The save is a
++    // read-only copy OUT of the live state, so any difference here means a destination
++    // pointer is landing somewhere it should not — and a scribble into the live arena
++    // would be indistinguishable from a fidelity gap in every other test.
++    if (r0) {
++        std::printf("[spec-rollback] --- C: ring inert (batch output unchanged by "
++                    "snapshotting) ---\n");
++        std::fflush(stdout);
++    }
++    for (int K = 2; K <= Kmax; ++K) {
++        std::vector<int> ids((size_t)K);
++        for (int b = 0; b < K; ++b) ids[(size_t)b] = cyc(prompt, b);
++        std::vector<float> off(r0 ? (size_t)K * vocab : 0), on(r0 ? (size_t)K * vocab : 0);
++
++        kimi_k3_dist_set_rollback(dist, false);
++        if (!replay() ||
++            !kimi_k3_dist_forward_batch(dist, coll, ids.data(), K,
++                                        r0 ? off.data() : nullptr, &err)) {
++            std::fprintf(stderr, "[spec-rollback] C ring-off K=%d failed: %s\n", K,
++                         err.c_str());
++            return 1;
++        }
++        kimi_k3_dist_set_rollback(dist, true);
++        if (!replay() ||
++            !kimi_k3_dist_forward_batch(dist, coll, ids.data(), K,
++                                        r0 ? on.data() : nullptr, &err)) {
++            std::fprintf(stderr, "[spec-rollback] C ring-on K=%d failed: %s\n", K,
++                         err.c_str());
++            return 1;
++        }
++        if (!r0) continue;
++        const bool same = std::memcmp(off.data(), on.data(),
++                                      (size_t)K * vocab * sizeof(float)) == 0;
++        if (!same) ++failures;
++        std::printf("[spec-rollback] C K=%d all %d rows bitwise-equal ring off vs on: "
++                    "%s\n", K, K, same ? "YES" : "**NO — RING PERTURBS THE PASS**");
++        std::fflush(stdout);
++    }
++
++    // -----------------------------------------------------------------------
++    // TEST A — SUFFIX INDEPENDENCE OF THE ROLLED-BACK STATE  (the Stage 3 gate)
++    // -----------------------------------------------------------------------
++    // Two batches sharing tokens 0..j and disagreeing on everything after. Roll both back
++    // to j, run the SAME forced continuation, and the logits must be BITWISE identical.
++    //
++    // This is one test but it closes four holes at once:
++    //   * the snapshot carries nothing from the rejected drafts (C1 for the state);
++    //   * the restore is complete — miss any one of the four buffers and the arms diverge,
++    //     which is the conv-window-ahead-of-delta failure the design doc calls out;
++    //   * the MLA KV rollback holds. The two arms wrote DIFFERENT values into the cache
++    //     rows the rejected tokens occupied, so if the continuation's attention ever read
++    //     past its own position the arms could not match;
++    //   * the residual bank really is intra-token scratch, since a leak across the batch
++    //       boundary would carry the fillers with it.
++    if (r0) {
++        std::printf("[spec-rollback] --- A: suffix independence after rollback "
++                    "(HARD GATE, bitwise) ---\n");
++        std::fflush(stdout);
++    }
++    kimi_k3_dist_set_rollback(dist, true);
++    for (int K = 2; K <= Kmax; ++K) {
++        for (int j = 0; j < K; ++j) {
++            std::vector<int> ia((size_t)K), ib((size_t)K);
++            for (int b = 0; b < K; ++b) ia[(size_t)b] = cyc(prompt, b);
++            for (int b = 0; b <= j; ++b) ib[(size_t)b] = ia[(size_t)b];
++            // Out-of-distribution and far apart: different experts, different KDA state,
++            // the loudest perturbation available without changing the shape by one byte.
++            for (int b = j + 1; b < K; ++b) ib[(size_t)b] = 1000 + 37 * b;
++
++            std::vector<float> ca, cb;
++            if (!replay() ||
++                !kimi_k3_dist_forward_batch(dist, coll, ia.data(), K, nullptr, &err) ||
++                !kimi_k3_dist_forward_rollback(dist, j, &err) ||
++                !continue_and_capture(ca)) {
++                std::fprintf(stderr, "[spec-rollback] A arm-A K=%d j=%d failed: %s\n", K, j,
++                             err.c_str());
++                return 1;
++            }
++            if (!replay() ||
++                !kimi_k3_dist_forward_batch(dist, coll, ib.data(), K, nullptr, &err) ||
++                !kimi_k3_dist_forward_rollback(dist, j, &err) ||
++                !continue_and_capture(cb)) {
++                std::fprintf(stderr, "[spec-rollback] A arm-B K=%d j=%d failed: %s\n", K, j,
++                             err.c_str());
++                return 1;
++            }
++            if (!r0) continue;
++
++            // j == K-1 shares every token with arm B by construction, so it is not a
++            // suffix test — it is the no-op arm of the rollback, and what it proves is
++            // that "accept everything" leaves the live state untouched and usable.
++            const char* kind = (j == K - 1) ? "no-op" : "suffix";
++            bool all_bit = true;
++            double worst_cos = 1.0;
++            for (int s = 0; s < n_cont; ++s) {
++                const Cmp c = compare_rows(ca.data() + (size_t)s * vocab,
++                                           cb.data() + (size_t)s * vocab, vocab);
++                if (!c.bitwise) all_bit = false;
++                if (c.cos < worst_cos) worst_cos = c.cos;
++            }
++            if (!all_bit) ++failures;
++            std::printf("[spec-rollback] A K=%d j=%d (%s) continuation bitwise-identical: "
++                        "%s  (worst cos=%.9f)\n", K, j, kind,
++                        all_bit ? "YES" : "**NO — SUFFIX LEAKED THROUGH ROLLBACK**",
++                        worst_cos);
++            std::fflush(stdout);
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // TEST D — DISTANCE TO PURE SEQUENTIAL DECODE  (MEASUREMENT, NOT A GATE)
++    // -----------------------------------------------------------------------
++    // Roll back to j and continue, versus consuming the same accepted tokens one at a time
++    // and continuing. Under a count-invariant collective these would be identical; here
++    // they are not, and the size of the gap is the number that decides whether Stage 4 can
++    // still claim "token-identical to non-speculative greedy" or has to claim the weaker
++    // and true "a valid greedy trajectory". Top-1 agreement is the figure that matters —
++    // it is the rate at which the difference would actually change an emitted token.
++    if (r0) {
++        std::printf("[spec-rollback] --- D: rollback+continue vs pure sequential "
++                    "(MEASUREMENT, not a gate) ---\n");
++        std::fflush(stdout);
++    }
++    for (int K = 2; K <= Kmax; ++K) {
++        for (int j = 0; j < K; ++j) {
++            std::vector<int> ids((size_t)K);
++            for (int b = 0; b < K; ++b) ids[(size_t)b] = cyc(prompt, b);
++
++            std::vector<float> spec, seq;
++            if (!replay() ||
++                !kimi_k3_dist_forward_batch(dist, coll, ids.data(), K, nullptr, &err) ||
++                !kimi_k3_dist_forward_rollback(dist, j, &err) ||
++                !continue_and_capture(spec)) {
++                std::fprintf(stderr, "[spec-rollback] D spec K=%d j=%d failed: %s\n", K, j,
++                             err.c_str());
++                return 1;
++            }
++            if (!replay()) {
++                std::fprintf(stderr, "[spec-rollback] D replay failed: %s\n", err.c_str());
++                return 1;
++            }
++            bool ok = true;
++            for (int b = 0; b <= j && ok; ++b)
++                ok = kimi_k3_dist_forward_token(dist, coll, ids[(size_t)b], nullptr, &err);
++            if (!ok || !continue_and_capture(seq)) {
++                std::fprintf(stderr, "[spec-rollback] D seq K=%d j=%d failed: %s\n", K, j,
++                             err.c_str());
++                return 1;
++            }
++            if (!r0) continue;
++            for (int s = 0; s < n_cont; ++s) {
++                const Cmp c = compare_rows(spec.data() + (size_t)s * vocab,
++                                           seq.data() + (size_t)s * vocab, vocab);
++                std::printf("[spec-rollback] D K=%d j=%d step=%d cos=%.9f top1 spec=%d "
++                            "seq=%d %s exact=%.4f%% max|d|=%.3e\n",
++                            K, j, s, c.cos, c.top_a, c.top_b,
++                            c.top_a == c.top_b ? "AGREE" : "DIFFER", c.exact_pct,
++                            c.maxabs);
++            }
++            std::fflush(stdout);
++        }
++    }
++
++    kimi_k3_dist_set_rollback(dist, false);
++    if (r0) {
++        std::printf("[spec-rollback] ===== %s ===== (%d hard-gate failure%s)\n",
++                    failures == 0 ? "STAGE 3 GATES PASS" : "STAGE 3 GATES FAIL",
++                    failures, failures == 1 ? "" : "s");
++        std::fflush(stdout);
++    }
++    return failures == 0 ? 0 : 1;
++}

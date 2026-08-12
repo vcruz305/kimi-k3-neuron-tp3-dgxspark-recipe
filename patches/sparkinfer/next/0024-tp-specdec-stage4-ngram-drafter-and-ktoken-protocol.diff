@@ -1,0 +1,1405 @@
+--- a/runtime/include/sparkinfer/tp/rank_protocol.h
++++ b/runtime/include/sparkinfer/tp/rank_protocol.h
+@@ -19,11 +19,21 @@
+ namespace tp {
+ namespace dist {
+ 
+-constexpr std::uint16_t kProtocolVersion = 1;
++// v2 widened the Token frame to carry a whole speculative verify batch plus the
++// rollback index for the PREVIOUS batch. The version is bumped rather than the frame
++// extended compatibly on purpose: a rank still running a v1 binary must reject the
++// frame loudly at decode instead of parsing the first token id and silently running a
++// 1-token step while its peers run a K-token one. Deploying a stale worker is a
++// failure mode this tree has already been bitten by once.
++constexpr std::uint16_t kProtocolVersion = 2;
+ constexpr int kK3Tp3WorldSize = 3;
+ constexpr int kK3Tp4WorldSize = 4;
+ constexpr int kNcclUniqueIdBytes = 128;
+ 
++// Ceiling on one step's token count (1 verified + up to kMaxStepTokens-1 drafted).
++// Bounds the wire frame so a malformed count cannot drive an unbounded allocation.
++constexpr int kMaxStepTokens = 16;
++
+ // Supported multi-Spark world sizes for the Neuron release geometry.
+ inline bool supported_k3_dist_world_size(int world_size) {
+     return world_size == kK3Tp3WorldSize || world_size == kK3Tp4WorldSize;
+@@ -31,8 +41,10 @@
+ constexpr std::size_t kDigestBytes = 32;
+ constexpr std::size_t kMaxDetailBytes = 256;
+ constexpr std::size_t kWireHeaderBytes = 16;
+-constexpr std::size_t kWireFixedPayloadBytes = 250;
+-constexpr std::size_t kMaxPayloadBytes = kWireFixedPayloadBytes + kMaxDetailBytes;
++// 250 in v1; +4 for rollback_j and +4 for the n_token_ids/reserved2 u16 pair.
++constexpr std::size_t kWireFixedPayloadBytes = 258;
++constexpr std::size_t kMaxPayloadBytes =
++    kWireFixedPayloadBytes + kMaxDetailBytes + (std::size_t)kMaxStepTokens * 4;
+ constexpr std::size_t kMaxFrameBytes = kWireHeaderBytes + kMaxPayloadBytes;
+ 
+ using Digest = std::array<std::uint8_t, kDigestBytes>;
+@@ -96,11 +108,22 @@
+     int vocab = 0;
+     int token_id = -1;
+     int status = 0;
++    // Roll the recurrent state back to "having consumed exactly rollback_j+1 tokens of
++    // the PREVIOUS step's batch", applied before this step's own tokens. -1 = nothing to
++    // roll back. Carried on the next Token rather than sent as its own message so a
++    // speculative step still costs exactly one control round trip and the "no later
++    // sequence before StepDone" gate stays exactly as strict as it was.
++    int rollback_j = -1;
+     Phase phase = Phase::None;
+     Digest model_digest{};
+     Digest plan_digest{};
+     NcclUniqueId nccl_id{};
+     std::string detail;
++    // Token frames only. Empty = ordinary single-token step described by token_id.
++    // Non-empty = the K tokens of a speculative verify batch, in recurrence order, with
++    // token_ids[0] == token_id so a reader that only understands the scalar still sees a
++    // consistent leading token.
++    std::vector<int> token_ids;
+ };
+ 
+ // Out-of-band identity supplied by the transport after it has authenticated or
+@@ -161,6 +184,14 @@
+     bool begin_step(int token_id, std::vector<Message>* outbound,
+                     std::string* error = nullptr);
+ 
++    // Broadcast a whole speculative verify batch as ONE step: n_tok tokens in recurrence
++    // order, preceded on each rank by a rollback to prev_rollback_j of the previous
++    // batch (-1 = none). Still one Token message per rank per sequence, so the sequence
++    // gate is untouched. The KV-reset sentinel is not admissible inside a batch — it is
++    // a whole-step operation and must go through begin_step.
++    bool begin_step_multi(const int* token_ids, int n_tok, int prev_rollback_j,
++                          std::vector<Message>* outbound, std::string* error = nullptr);
++
+     // Clean EOS. Finish is sequence-gated and acknowledged by every rank; Finished
+     // is distinct from Failed so a normal generator shutdown is never reported as
+     // an abort.
+@@ -217,8 +248,16 @@
+ 
+     // Accept NcclUniqueId, BeginLoad, Token, Finish, or Abort. For Token, token_id
+     // receives the synchronized input. No later sequence is accepted before StepDone.
++    //
++    // token_ids and rollback_j receive the speculative batch and the pending rollback
++    // index when the coordinator sent one. A caller that passes neither still works and
++    // sees the leading token — but a Token carrying MORE THAN ONE id is REJECTED when
++    // token_ids is null, because running only the first token of a batch the other ranks
++    // are running whole would desynchronize the collectives.
+     bool accept_control(const Message& message, int* token_id = nullptr,
+-                        std::string* error = nullptr);
++                        std::string* error = nullptr,
++                        std::vector<int>* token_ids = nullptr,
++                        int* rollback_j = nullptr);
+ 
+     bool report_nccl_ready(bool success, int status, const std::string& detail,
+                            Message* outbound, std::string* error = nullptr);
+--- a/runtime/src/tp/rank_protocol.cpp
++++ b/runtime/src/tp/rank_protocol.cpp
+@@ -199,6 +199,14 @@
+         set_error(error, "diagnostic detail exceeds protocol bound");
+         return false;
+     }
++    if (m.token_ids.size() > (std::size_t)kMaxStepTokens) {
++        set_error(error, "step token count exceeds protocol bound");
++        return false;
++    }
++    if (!m.token_ids.empty() && m.token_ids[0] != m.token_id) {
++        set_error(error, "token_ids[0] disagrees with token_id");
++        return false;
++    }
+ 
+     std::vector<std::uint8_t> payload;
+     payload.reserve(kWireFixedPayloadBytes + m.detail.size());
+@@ -213,13 +221,17 @@
+     put_i32(payload, m.vocab);
+     put_i32(payload, m.token_id);
+     put_i32(payload, m.status);
++    put_i32(payload, m.rollback_j);
+     put_u16(payload, phase);
+     put_u16(payload, 0);  // reserved; must decode as zero
++    put_u16(payload, static_cast<std::uint16_t>(m.token_ids.size()));
++    put_u16(payload, 0);  // reserved2; must decode as zero
+     payload.insert(payload.end(), m.model_digest.begin(), m.model_digest.end());
+     payload.insert(payload.end(), m.plan_digest.begin(), m.plan_digest.end());
+     payload.insert(payload.end(), m.nccl_id.begin(), m.nccl_id.end());
+     put_u16(payload, static_cast<std::uint16_t>(m.detail.size()));
+     payload.insert(payload.end(), m.detail.begin(), m.detail.end());
++    for (int id : m.token_ids) put_i32(payload, id);
+ 
+     frame->clear();
+     if (payload.size() < kWireFixedPayloadBytes || payload.size() > kMaxPayloadBytes) {
+@@ -264,13 +276,13 @@
+     Reader r{payload, payload_size, 0};
+     Message m;
+     m.type = static_cast<MessageType>(type);
+-    std::uint16_t phase = 0, reserved = 0, detail_size = 0;
++    std::uint16_t phase = 0, reserved = 0, n_ids = 0, reserved2 = 0, detail_size = 0;
+     if (!r.u64(&m.session_id) || !r.u64(&m.sequence) ||
+         !r.i32(&m.rank) || !r.i32(&m.world_size) || !r.i32(&m.local_device) ||
+         !r.i32(&m.n_experts) || !r.i32(&m.moe_ffn) ||
+         !r.i32(&m.expert_block_elems) || !r.i32(&m.vocab) ||
+-        !r.i32(&m.token_id) || !r.i32(&m.status) ||
+-        !r.u16(&phase) || !r.u16(&reserved) ||
++        !r.i32(&m.token_id) || !r.i32(&m.status) || !r.i32(&m.rollback_j) ||
++        !r.u16(&phase) || !r.u16(&reserved) || !r.u16(&n_ids) || !r.u16(&reserved2) ||
+         !r.bytes(m.model_digest.data(), m.model_digest.size()) ||
+         !r.bytes(m.plan_digest.data(), m.plan_digest.size()) ||
+         !r.bytes(m.nccl_id.data(), m.nccl_id.size()) ||
+@@ -278,13 +290,29 @@
+         set_error(error, "truncated message payload"); return false;
+     }
+     if (!valid_phase(phase)) { set_error(error, "unknown protocol phase"); return false; }
+-    if (reserved != 0) { set_error(error, "nonzero reserved field"); return false; }
+-    if (detail_size > kMaxDetailBytes || r.at + detail_size != r.size) {
++    if (reserved != 0 || reserved2 != 0) {
++        set_error(error, "nonzero reserved field"); return false;
++    }
++    if (n_ids > kMaxStepTokens) {
++        set_error(error, "step token count outside protocol bounds"); return false;
++    }
++    if (detail_size > kMaxDetailBytes || r.at + detail_size > r.size) {
+         set_error(error, "invalid diagnostic detail length"); return false;
+     }
+     m.phase = static_cast<Phase>(phase);
+     m.detail.assign(reinterpret_cast<const char*>(r.data + r.at), detail_size);
+     r.at += detail_size;
++    m.token_ids.resize(n_ids);
++    for (std::uint16_t i = 0; i < n_ids; ++i) {
++        if (!r.i32(&m.token_ids[i])) {
++            set_error(error, "truncated step token vector"); return false;
++        }
++    }
++    // Exact length, as in v1: a frame with trailing bytes is malformed, not tolerated.
++    if (r.at != r.size) { set_error(error, "trailing bytes after payload"); return false; }
++    if (n_ids > 0 && m.token_ids[0] != m.token_id) {
++        set_error(error, "token_ids[0] disagrees with token_id"); return false;
++    }
+     *message = std::move(m);
+     return true;
+ }
+@@ -521,6 +549,43 @@
+     return true;
+ }
+ 
++bool Coordinator::begin_step_multi(const int* token_ids, int n_tok, int prev_rollback_j,
++                                   std::vector<Message>* outbound, std::string* error) {
++    if (state_ != CoordinatorState::Ready) {
++        if (state_ == CoordinatorState::Failed) { set_error(error, failure_); return false; }
++        if (state_ == CoordinatorState::Finished) {
++            set_error(error, "cluster already finished");
++            return false;
++        }
++        return abort_cluster(Phase::Step, -14, "batch started before cluster Ready",
++                             outbound, error);
++    }
++    if (!outbound) return abort_cluster(Phase::Step, -15,
++                                        "batch broadcast has no outbound sink", outbound, error);
++    if (!token_ids || n_tok < 1 || n_tok > kMaxStepTokens)
++        return abort_cluster(Phase::Step, -23, "batch token count outside protocol bounds",
++                             outbound, error);
++    // No -2 sentinel here: a KV reset is a whole-step operation, not a batch member.
++    for (int b = 0; b < n_tok; ++b)
++        if (token_ids[b] < 0 || token_ids[b] >= cluster_.vocab)
++            return abort_cluster(Phase::Step, -16, "batch token id outside vocabulary",
++                                 outbound, error);
++    if (prev_rollback_j < -1 || prev_rollback_j >= kMaxStepTokens)
++        return abort_cluster(Phase::Step, -24, "rollback index outside protocol bounds",
++                             outbound, error);
++    std::fill(step_done_.begin(), step_done_.end(), 0);
++    for (int rank = 0; rank < cluster_.world_size; ++rank) {
++        Message m = control(MessageType::Token, rank);
++        m.phase = Phase::Step;
++        m.token_id = token_ids[0];
++        m.rollback_j = prev_rollback_j;
++        m.token_ids.assign(token_ids, token_ids + n_tok);
++        outbound->push_back(std::move(m));
++    }
++    state_ = CoordinatorState::StepInFlight;
++    return true;
++}
++
+ bool Coordinator::finish(std::vector<Message>* outbound, std::string* error) {
+     if (state_ != CoordinatorState::Ready) {
+         if (state_ == CoordinatorState::Failed) { set_error(error, failure_); return false; }
+@@ -585,7 +650,8 @@
+     return true;
+ }
+ 
+-bool RankSession::accept_control(const Message& m, int* token_id, std::string* error) {
++bool RankSession::accept_control(const Message& m, int* token_id, std::string* error,
++                                 std::vector<int>* token_ids, int* rollback_j) {
+     if (m.session_id != spec_.session_id || m.world_size != spec_.world_size ||
+         m.rank != spec_.rank || m.local_device != spec_.local_device ||
+         m.n_experts != spec_.n_experts || m.moe_ffn != spec_.moe_ffn ||
+@@ -641,7 +707,23 @@
+             if (!(m.token_id == -2) && (m.token_id < 0 || m.token_id >= spec_.vocab))
+                 return reject("Token id outside vocabulary", error);
+             if (!token_id) return reject("Token has no output sink", error);
++            if (m.token_ids.size() > (std::size_t)kMaxStepTokens)
++                return reject("Token batch exceeds protocol bound", error);
++            // Running only the leading token of a batch every other rank runs whole would
++            // leave this rank issuing a different number of collectives, which hangs NCCL
++            // rather than failing — refuse it here where the diagnostic is readable.
++            if (m.token_ids.size() > 1 && !token_ids)
++                return reject("Token batch has no batch output sink", error);
++            for (std::size_t b = 0; b < m.token_ids.size(); ++b)
++                if (m.token_ids[b] < 0 || m.token_ids[b] >= spec_.vocab)
++                    return reject("Token batch id outside vocabulary", error);
++            if (m.rollback_j < -1 || m.rollback_j >= kMaxStepTokens)
++                return reject("Token rollback index outside protocol bounds", error);
++            if (m.rollback_j >= 0 && !rollback_j)
++                return reject("Token rollback has no output sink", error);
+             *token_id = m.token_id;
++            if (token_ids) *token_ids = m.token_ids;
++            if (rollback_j) *rollback_j = m.rollback_j;
+             state_ = RankState::StepRunning;
+             return true;
+ 
+--- a/runtime/include/sparkinfer/tp/rank_transport.h
++++ b/runtime/include/sparkinfer/tp/rank_transport.h
+@@ -138,6 +138,10 @@
+     CoordinatorState state() const;
+ 
+     bool begin_step(int token_id, std::string* error = nullptr);
++    // One speculative verify batch as a single step, preceded on every rank by a
++    // rollback to prev_rollback_j of the previous batch (-1 = none).
++    bool begin_step_multi(const int* token_ids, int n_tok, int prev_rollback_j,
++                          std::string* error = nullptr);
+     bool finish(std::string* error = nullptr);
+     bool fail(const std::string& detail, std::string* error = nullptr);
+ 
+@@ -187,7 +191,13 @@
+     // Block until next Token, Finish, or Abort. Returns false on failure/finish.
+     // When true, *token_id is the synchronized input and the caller must run the
+     // local forward then call report_step_done.
+-    bool wait_token(int* token_id, std::string* error = nullptr);
++    //
++    // token_ids receives the whole speculative batch when one was sent (empty otherwise),
++    // and rollback_j the index to roll the PREVIOUS batch back to before running this
++    // step (-1 = none). A caller that passes neither cannot be sent a batch: the session
++    // rejects a multi-token Token with no sink rather than silently running token 0.
++    bool wait_token(int* token_id, std::string* error = nullptr,
++                    std::vector<int>* token_ids = nullptr, int* rollback_j = nullptr);
+     bool report_step_done(bool success, int status, const std::string& detail,
+                           std::string* error = nullptr);
+     bool wait_finished(std::string* error = nullptr);
+--- a/runtime/src/tp/rank_transport_tcp.cpp
++++ b/runtime/src/tp/rank_transport_tcp.cpp
+@@ -714,6 +714,15 @@
+     return dispatch_outbound(outbound, error);
+ }
+ 
++bool CoordinatorTransport::begin_step_multi(const int* token_ids, int n_tok,
++                                            int prev_rollback_j, std::string* error) {
++    std::lock_guard<std::mutex> lock(mu_);
++    std::vector<Message> outbound;
++    if (!coord_.begin_step_multi(token_ids, n_tok, prev_rollback_j, &outbound, error))
++        return false;
++    return dispatch_outbound(outbound, error);
++}
++
+ bool CoordinatorTransport::finish(std::string* error) {
+     // Do NOT hold mu_ across the wait — rx_loop needs mu_ to accept worker FinishAcks.
+     {
+@@ -924,11 +933,14 @@
+     return session_.state() == RankState::WaitingToken;
+ }
+ 
+-bool RankTransport::wait_token(int* token_id, std::string* error) {
++bool RankTransport::wait_token(int* token_id, std::string* error,
++                               std::vector<int>* token_ids, int* rollback_j) {
+     Message m;
++    if (token_ids) token_ids->clear();
++    if (rollback_j) *rollback_j = -1;
+     if (!recv(&m, error)) return false;
+     int tok = -1;
+-    if (!session_.accept_control(m, &tok, error)) return false;
++    if (!session_.accept_control(m, &tok, error, token_ids, rollback_j)) return false;
+     if (m.type == MessageType::Finish || m.type == MessageType::Abort) {
+         return false;
+     }
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include "sparkinfer/models/kimi_k3_dist_forward.h"
+ #include "sparkinfer/models/kimi_k3_dist_rank.h"
++#include "sparkinfer/models/kimi_k3_ngram_draft.h"
+ #include "sparkinfer/tp/rank_protocol.h"
+ #include "sparkinfer/tp/rank_transport.h"
+ 
+@@ -54,10 +55,15 @@
+                  "          [--session-id N] [--dry-protocol]\n"
+                  "          [--spec-bench K]     # batched-verify fidelity + step(K) cost\n"
+                  "          [--spec-rollback K] [--spec-cont N]   # Stage 3 rollback gates\n"
++                 "          [--spec-draft K]     # Stage 4 n-gram speculative decode, batch width K\n"
++                 "          [--spec-ngram-max N] [--spec-ngram-min N]   # default 3 / 1\n"
+                  "\n"
+                  "  KV reset sentinel token id = -2 (broadcast between multi-prompts).\n"
+                  "  --spec-bench and --spec-rollback exchange no control messages, so\n"
+-                 "  EVERY rank must be given the SAME flag and the SAME --prompt-ids.\n",
++                 "  EVERY rank must be given the SAME flag and the SAME --prompt-ids.\n"
++                 "  --spec-draft DOES use the control plane (rank0 picks drafts from its\n"
++                 "  own history), but every rank still needs the flag so workers arm the\n"
++                 "  rollback ring and accept K-token steps. Needs PREFILL_CHUNK >= K.\n",
+                  argv0);
+ }
+ 
+@@ -448,6 +454,8 @@
+     int spec_bench = 0;   // --spec-bench K: batched-verify correctness + step(K) timing
+     int spec_rollback = 0;   // --spec-rollback K: Stage 3 state-rollback gates
+     int spec_cont = 3;       // --spec-cont N: continuation steps the rollback check runs
++    int spec_draft = 0;      // --spec-draft K: Stage 4 speculative decode, batch width K
++    K3NgramDraftConfig ngram_cfg;
+ 
+     for (int i = 1; i < argc; ++i) {
+         auto need = [&](const char* flag) -> const char* {
+@@ -477,6 +485,11 @@
+         else if (!std::strcmp(argv[i], "--spec-rollback"))
+             spec_rollback = std::atoi(need("--spec-rollback"));
+         else if (!std::strcmp(argv[i], "--spec-cont")) spec_cont = std::atoi(need("--spec-cont"));
++        else if (!std::strcmp(argv[i], "--spec-draft")) spec_draft = std::atoi(need("--spec-draft"));
++        else if (!std::strcmp(argv[i], "--spec-ngram-max"))
++            ngram_cfg.n_max = std::atoi(need("--spec-ngram-max"));
++        else if (!std::strcmp(argv[i], "--spec-ngram-min"))
++            ngram_cfg.n_min = std::atoi(need("--spec-ngram-min"));
+         else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
+             usage(argv[0]);
+             return 0;
+@@ -503,6 +516,29 @@
+         std::fprintf(stderr, "workers require --coord HOST:PORT\n");
+         return 2;
+     }
++    if (spec_draft != 0) {
++        if (spec_draft < 2 || spec_draft > kMaxStepTokens) {
++            std::fprintf(stderr, "--spec-draft K must be in [2,%d]\n", kMaxStepTokens);
++            return 2;
++        }
++        if (ngram_cfg.n_min < 1 || ngram_cfg.n_max < ngram_cfg.n_min) {
++            std::fprintf(stderr, "need 1 <= --spec-ngram-min <= --spec-ngram-max\n");
++            return 2;
++        }
++        // forward_batch sizes its scratch from PREFILL_CHUNK and refuses a wider batch.
++        // Checked here rather than discovered as a mid-generation failure on one rank.
++        int chunk = 64;
++        if (const char* e = std::getenv("SPARKINFER_K3_PREFILL_CHUNK")) {
++            const int v = std::atoi(e);
++            if (v > 0) chunk = v;
++        }
++        if (chunk < spec_draft) {
++            std::fprintf(stderr,
++                         "--spec-draft %d needs SPARKINFER_K3_PREFILL_CHUNK >= %d "
++                         "(currently %d)\n", spec_draft, spec_draft, chunk);
++            return 2;
++        }
++    }
+ 
+     RankSpec spec;
+     spec.session_id = session_id ? session_id : 1;
+@@ -653,6 +689,22 @@
+ 
+         std::vector<float> logits((size_t)dist.cfg.vocab);
+ 
++        // Stage 4 speculative decode. The ring must be armed BEFORE the first
++        // forward_batch: allocation is lazy inside it, and a batch that ran without it
++        // saved no boundaries, so any later rejection would have nothing to restore.
++        std::vector<float> batch_logits;
++        std::vector<long long> spec_drafted_at, spec_accepted_at;
++        long long spec_steps = 0, spec_draft_steps = 0, spec_sum_d = 0, spec_sum_j = 0;
++        if (spec_draft > 0) {
++            kimi_k3_dist_set_rollback(dist, true);
++            batch_logits.assign((size_t)spec_draft * (size_t)dist.cfg.vocab, 0.0f);
++            spec_drafted_at.assign((size_t)spec_draft, 0);
++            spec_accepted_at.assign((size_t)spec_draft, 0);
++            std::printf("[spec-draft] ON K=%d ngram n=[%d,%d]\n", spec_draft,
++                        ngram_cfg.n_min, ngram_cfg.n_max);
++            std::fflush(stdout);
++        }
++
+         auto one_step = [&](int tok, float* logits_out) -> bool {
+             {
+                 char buf[96];
+@@ -709,6 +761,49 @@
+             return true;
+         };
+ 
++        // One speculative step. Delivers this batch AND the previous batch's rollback
++        // index in a single Token message, so a speculative step still costs exactly one
++        // control round trip and the "no later sequence before StepDone" gate is
++        // untouched. W == 1 deliberately takes the ordinary single-token forward: a
++        // no-match step has to cost what it cost before drafting existed, which is the
++        // property that makes prompt-lookup affordable at all.
++        auto spec_step = [&](const int* ids, int W, int prev_rb, float* logits_out) -> bool {
++            if (!ctr.begin_step_multi(ids, W, prev_rb, &err)) {
++                std::fprintf(stderr, "begin_step_multi: %s\n", err.c_str());
++                std::fflush(stderr);
++                return false;
++            }
++            if (prev_rb >= 0 && !kimi_k3_dist_forward_rollback(dist, prev_rb, &err)) {
++                std::fprintf(stderr, "spec rollback: %s\n", err.c_str());
++                std::fflush(stderr);
++                ctr.complete_local_step(false, 1, err, nullptr);
++                ctr.fail(err, nullptr);
++                return false;
++            }
++            const bool fwd_ok =
++                (W == 1)
++                    ? kimi_k3_dist_forward_token(dist, *coll, ids[0], logits_out, &err)
++                    : kimi_k3_dist_forward_batch(dist, *coll, ids, W, logits_out, &err);
++            if (!fwd_ok) {
++                std::fprintf(stderr, "spec forward: %s\n", err.c_str());
++                std::fflush(stderr);
++                ctr.complete_local_step(false, 1, err, nullptr);
++                ctr.fail(err, nullptr);
++                return false;
++            }
++            if (!ctr.complete_local_step(true, 0, "", &err)) {
++                std::fprintf(stderr, "complete_local_step(spec): %s\n", err.c_str());
++                std::fflush(stderr);
++                return false;
++            }
++            if (!ctr.pump(std::chrono::milliseconds(600000), &err)) {
++                std::fprintf(stderr, "pump(spec): %s\n", err.c_str());
++                std::fflush(stderr);
++                return false;
++            }
++            return true;
++        };
++
+         using clock = std::chrono::steady_clock;
+         double sum_decode_tps = 0.0;
+         int n_ok = 0;
+@@ -746,21 +841,101 @@
+ 
+             std::vector<int> generated;
+             const auto t_gen0 = clock::now();
+-            for (int n = 0; n < n_predict; ++n) {
+-                const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
++            if (spec_draft > 0) {
++                // ctx is everything the model has consumed PLUS the one token about to be
++                // fed, because the drafter predicts what follows that token. Leaving it
++                // out would shift every proposal one position early.
++                std::vector<int> ctx = prompt;
++                int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
+                 generated.push_back(next);
+-                std::printf(" gen[%d]=%d\n", n, next);
+-                std::fflush(stdout);
+-                {
+-                    char buf[96];
+-                    std::snprintf(buf, sizeof(buf), "rank0 gen[%d]=%d", n, next);
+-                    gen_trace(buf);
++                ctx.push_back(next);
++
++                int pending_rb = -1;
++                std::vector<int> draft, batch;
++                while ((int)generated.size() < n_predict) {
++                    // Every pass emits its verified token whatever the drafts do, so only
++                    // budget-1 further positions can be used. Drafting past that would buy
++                    // output this run then discards, and inflate the tok/s it reports.
++                    const int budget = n_predict - (int)generated.size();
++                    int max_draft = spec_draft - 1;
++                    if (max_draft > budget - 1) max_draft = budget - 1;
++
++                    draft.clear();
++                    const int d = max_draft > 0
++                        ? kimi_k3_ngram_draft(ctx, max_draft, ngram_cfg, &draft)
++                        : 0;
++
++                    batch.assign((size_t)1, next);
++                    for (int i = 0; i < d; ++i) batch.push_back(draft[(size_t)i]);
++                    if (!spec_step(batch.data(), (int)batch.size(), pending_rb,
++                                   batch_logits.data()))
++                        return 1;
++
++                    // Longest accepted prefix. Row i's argmax is the true token following
++                    // position i, so draft i is accepted exactly when it equals that. The
++                    // first mismatch ends the run and ITS argmax is the bonus token, which
++                    // was computed from a fully verified prefix and is therefore emitted
++                    // whatever was drafted — that is the token this step would have
++                    // produced with no drafting at all.
++                    int bonus = -1;
++                    const int j = kimi_k3_spec_accept_prefix(
++                        draft.data(), d,
++                        [&](int row) {
++                            return kimi_k3_dist_argmax(
++                                batch_logits.data() + (size_t)row * (size_t)dist.cfg.vocab,
++                                dist.cfg.vocab);
++                        },
++                        &bonus);
++
++                    // Position i counts as REACHED only when every earlier draft was
++                    // accepted; positions past the first mismatch were never tested and
++                    // folding them into the denominator would understate acceptance
++                    // exactly where the design's N-vs-throughput table reads it.
++                    for (int i = 0; i < d && i <= j; ++i) {
++                        ++spec_drafted_at[(size_t)i];
++                        if (i < j) ++spec_accepted_at[(size_t)i];
++                    }
++
++                    for (int i = 0; i < j; ++i) {
++                        ctx.push_back(draft[(size_t)i]);
++                        generated.push_back(draft[(size_t)i]);
++                    }
++                    generated.push_back(bonus);
++                    next = bonus;
++                    ctx.push_back(next);
++
++                    // The pass consumed positions 0..j; j+1..d were rejected and their
++                    // state updates must be undone before anything else runs. Deferred
++                    // onto the next Token so it costs no extra round trip. A W == 1 step
++                    // ran forward_token, which leaves no batch to roll back.
++                    pending_rb = ((int)batch.size() > 1) ? j : -1;
++
++                    ++spec_steps;
++                    if (d > 0) ++spec_draft_steps;
++                    spec_sum_d += d;
++                    spec_sum_j += j;
++                    std::printf(" spec step=%lld d=%d acc=%d emit=%d total=%zu\n",
++                                spec_steps, d, j, j + 1, generated.size());
++                    std::fflush(stdout);
++                }
++            } else {
++                for (int n = 0; n < n_predict; ++n) {
++                    const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
++                    generated.push_back(next);
++                    std::printf(" gen[%d]=%d\n", n, next);
++                    std::fflush(stdout);
++                    {
++                        char buf[96];
++                        std::snprintf(buf, sizeof(buf), "rank0 gen[%d]=%d", n, next);
++                        gen_trace(buf);
++                    }
++                    if (!one_step(next, logits.data())) return 1;
+                 }
+-                if (!one_step(next, logits.data())) return 1;
+             }
+             const auto t_gen1 = clock::now();
+             const double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
+-            const double decode_tps = gen_s > 0 ? (double)n_predict / gen_s : 0.0;
++            const double decode_tps =
++                gen_s > 0 ? (double)generated.size() / gen_s : 0.0;
+             sum_decode_tps += decode_tps;
+             ++n_ok;
+             std::printf("OK generated %zu tokens in %.3fs (decode_tok_s=%.4f) prompt=%zu\n",
+@@ -778,6 +953,30 @@
+             std::fflush(stderr);
+         }
+ 
++        if (spec_draft > 0 && spec_steps > 0) {
++            // Per-position acceptance is the number the design's N-vs-throughput table is
++            // indexed by, so it is reported per position and not only as one mean. A
++            // position is counted as drafted only on steps that actually reached it: the
++            // drafter proposes fewer than K-1 tokens whenever the match is short, and
++            // dividing by total steps would understate acceptance where it matters.
++            std::printf("\n[spec-draft] steps=%lld  with_draft=%lld  no_match=%lld\n",
++                        spec_steps, spec_draft_steps, spec_steps - spec_draft_steps);
++            std::printf("[spec-draft] drafted=%lld accepted=%lld  acceptance=%.4f\n",
++                        spec_sum_d, spec_sum_j,
++                        spec_sum_d > 0 ? (double)spec_sum_j / (double)spec_sum_d : 0.0);
++            std::printf("[spec-draft] mean_draft_len=%.3f  mean_emitted_per_step=%.3f\n",
++                        (double)spec_sum_d / (double)spec_steps,
++                        (double)(spec_sum_j + spec_steps) / (double)spec_steps);
++            for (int i = 0; i + 1 < spec_draft; ++i) {
++                const long long dr = spec_drafted_at[(size_t)i];
++                if (dr == 0) continue;
++                std::printf("[spec-draft] pos=%d drafted=%lld accepted=%lld p=%.4f\n", i,
++                            dr, spec_accepted_at[(size_t)i],
++                            (double)spec_accepted_at[(size_t)i] / (double)dr);
++            }
++            std::fflush(stdout);
++        }
++
+         if (n_ok > 0) {
+             std::printf("OK multi-prompt summary prompts=%d mean_decode_tok_s=%.4f\n", n_ok,
+                         sum_decode_tps / (double)n_ok);
+@@ -851,14 +1050,21 @@
+         return rc;
+     }
+ 
++    // Workers arm the ring for the same reason rank 0 does: they hold their own shard of
++    // the KDA state, so a rejected draft has to be undone on every rank, not just the one
++    // that made the accept decision. Arming must happen before the first batched pass.
++    if (spec_draft > 0) kimi_k3_dist_set_rollback(dist, true);
++
++    std::vector<int> w_ids;
+     for (;;) {
+         int tok = -1;
++        int w_rb = -1;
+         {
+             char buf[64];
+             std::snprintf(buf, sizeof(buf), "rank%d wait_token enter", rank);
+             gen_trace(buf);
+         }
+-        if (!wtr.wait_token(&tok, &err)) {
++        if (!wtr.wait_token(&tok, &err, &w_ids, &w_rb)) {
+             if (wtr.state() == RankState::Finished || wtr.state() == RankState::FinishPending) {
+                 wtr.wait_finished(nullptr);
+                 std::printf("[rank %d] finished\n", rank);
+@@ -875,6 +1081,15 @@
+             std::snprintf(buf, sizeof(buf), "rank%d wait_token got tok=%d; forward enter", rank, tok);
+             gen_trace(buf);
+         }
++        // The previous batch's rejected suffix, undone before this step touches the
++        // state. Ordering is load-bearing: forward_token drops the batch bookkeeping, so
++        // a rollback deferred past one would be refused rather than silently wrong.
++        if (w_rb >= 0 && !kimi_k3_dist_forward_rollback(dist, w_rb, &err)) {
++            wtr.report_step_done(false, 1, err, nullptr);
++            std::fprintf(stderr, "worker rollback: %s\n", err.c_str());
++            std::fflush(stderr);
++            return 1;
++        }
+         if (tok == kKvResetSentinel) {
+             gen_trace("worker KV reset sentinel");
+             kimi_k3_reset_state(dist.state);
+@@ -889,7 +1104,12 @@
+             }
+             continue;
+         }
+-        if (!kimi_k3_dist_forward_token(dist, *coll, tok, nullptr, &err)) {
++        const bool w_ok =
++            w_ids.size() > 1
++                ? kimi_k3_dist_forward_batch(dist, *coll, w_ids.data(), (int)w_ids.size(),
++                                             nullptr, &err)
++                : kimi_k3_dist_forward_token(dist, *coll, tok, nullptr, &err);
++        if (!w_ok) {
+             wtr.report_step_done(false, 1, err, nullptr);
+             std::fprintf(stderr, "forward: %s\n", err.c_str());
+             std::fflush(stderr);
+--- a/runtime/tests/tp3_rank_protocol_cpu_test.cpp
++++ b/runtime/tests/tp3_rank_protocol_cpu_test.cpp
+@@ -56,7 +56,8 @@
+            a.expert_block_elems == b.expert_block_elems && a.vocab == b.vocab &&
+            a.token_id == b.token_id && a.status == b.status && a.phase == b.phase &&
+            a.model_digest == b.model_digest && a.plan_digest == b.plan_digest &&
+-           a.nccl_id == b.nccl_id && a.detail == b.detail;
++           a.nccl_id == b.nccl_id && a.detail == b.detail &&
++           a.rollback_j == b.rollback_j && a.token_ids == b.token_ids;
+ }
+ 
+ static Message wire(const Message& in) {
+@@ -187,10 +188,17 @@
+               error.find("magic") != std::string::npos,
+           "bad magic must fail");
+     corrupt = bytes;
+-    corrupt[4] = 2; corrupt[5] = 0;
++    // Any version other than the current one, including the PREVIOUS one: a rank running
++    // a v1 binary must reject a v2 Token rather than parse its scalar token_id and run a
++    // 1-token step while its peers run the whole batch.
++    corrupt[4] = 1; corrupt[5] = 0;
+     CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
+               error.find("version") != std::string::npos,
+-          "bad version must fail");
++          "superseded version must fail");
++    corrupt[4] = (std::uint8_t)(kProtocolVersion + 1); corrupt[5] = 0;
++    CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
++              error.find("version") != std::string::npos,
++          "future version must fail");
+     corrupt = bytes;
+     corrupt[6] = 99; corrupt[7] = 0;
+     CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
+@@ -211,7 +219,17 @@
+           "oversized detail must fail");
+     hello.detail.assign(kMaxDetailBytes, 'x');
+     CHECK(encode_message(hello, &bytes, &error), "maximum-size frame must encode");
++    // v2 added a variable token-id tail, so the largest frame a transport must be sized
++    // for is max detail AND a full speculative batch, not max detail alone.
++    CHECK_EQ(bytes.size(), kWireHeaderBytes + kWireFixedPayloadBytes + kMaxDetailBytes);
++    hello.token_id = 5;
++    hello.token_ids.assign(kMaxStepTokens, 5);
++    CHECK(encode_message(hello, &bytes, &error), "maximum batch frame must encode");
+     CHECK_EQ(bytes.size(), kMaxFrameBytes);
++    CHECK(same_message(hello, wire(hello)), "maximum batch frame must round-trip");
++    hello.token_ids.assign(kMaxStepTokens + 1, 5);
++    CHECK(!encode_message(hello, &bytes, &error) && error.find("bound") != std::string::npos,
++          "oversized batch must fail: %s", error.c_str());
+ }
+ 
+ static void test_full_bootstrap_load_and_two_steps() {
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -186,6 +186,12 @@
+     target_link_libraries(kimi_k3_kda_batch_check PRIVATE sparkinfer_runtime CUDA::cudart)
+     set_target_properties(kimi_k3_kda_batch_check PROPERTIES CXX_STANDARD 17)
+ 
++    # Stage 4 host-side gates: drafter, accept rule, loop algebra, K-token protocol.
++    # No CUDA, no model, no fleet — runs anywhere the runtime library builds.
++    add_executable(kimi_k3_spec_draft_check examples/kimi_k3_spec_draft_check.cpp)
++    target_link_libraries(kimi_k3_spec_draft_check PRIVATE sparkinfer_runtime CUDA::cudart)
++    set_target_properties(kimi_k3_spec_draft_check PROPERTIES CXX_STANDARD 17)
++
+     add_executable(kimi_k3_tp_width_check examples/kimi_k3_tp_width_check.cpp)
+     target_link_libraries(kimi_k3_tp_width_check PRIVATE sparkinfer_runtime CUDA::cudart)
+     set_target_properties(kimi_k3_tp_width_check PROPERTIES CXX_STANDARD 17)
+diff --git a/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h b/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h
+@@ -0,0 +1,91 @@
++#pragma once
++// Prompt-lookup (n-gram self-speculation) drafter — pure host logic, no GPU, no NCCL.
++//
++// At each decode step the caller asks: given everything generated so far, what tokens
++// are likely to come next? This answers by finding where the current tail last occurred
++// earlier in the same sequence and proposing whatever followed it that time. It is the
++// whole drafting strategy for K3 speculative decoding, chosen because the model occupies
++// ~110 GB of each Spark's 121 GB and leaves no room for draft weights, and because a
++// drafter that costs nothing when it declines to draft is nearly free to attempt against
++// a break-even acceptance of ~0.13.
++//
++// Cost is a backward memcmp scan over a few thousand ints — microseconds, off the GPU and
++// off the critical path. Header-only so the decode loop and its test share one definition
++// rather than two that can drift.
++
++#include <cstddef>
++#include <cstring>
++#include <vector>
++
++namespace sparkinfer {
++
++struct K3NgramDraftConfig {
++    // Longest tail matched first. Longer matches are rarer but far likelier to continue
++    // correctly, so the scan is strictly best-first: the first n that hits wins.
++    int n_max = 3;
++    // Shortest tail the drafter will accept a match on. Measured on TP3, 3 workloads,
++    // 64 tokens each, against a two-run baseline: n_min = 1 fires on almost every step
++    // because some single token always recurs, and those matches are mostly junk — it
++    // cost freeform prose 12.5% (a K-wide pass bought ~1 token) while buying only 8% more
++    // on code than n_min = 2 does. n_min = 3 is too shy: it drafts on 16% of steps and
++    // gives back most of the win. 2 is the measured optimum, not a guess.
++    int n_min = 2;
++};
++
++// Propose up to max_draft continuation tokens for ctx, appending them to *out.
++// Returns the number proposed; 0 means "no match, take the ordinary single-token path".
++//
++// ctx must be the FULL token history the model has consumed plus the one token the
++// caller is about to feed — the drafter predicts what follows that token, so leaving it
++// out shifts every proposal one position early.
++inline int kimi_k3_ngram_draft(const std::vector<int>& ctx, int max_draft,
++                               const K3NgramDraftConfig& cfg, std::vector<int>* out) {
++    if (!out || max_draft <= 0 || ctx.empty()) return 0;
++    const long long len = (long long)ctx.size();
++    const int n_hi = cfg.n_max < (int)len ? cfg.n_max : (int)len;
++    const int n_lo = cfg.n_min < 1 ? 1 : cfg.n_min;
++
++    for (int n = n_hi; n >= n_lo; --n) {
++        const int* pat = ctx.data() + (len - n);
++        // Backward from the latest possible start, so the FIRST hit is the most recent
++        // occurrence. Recency matters: in structured output the nearest repetition is the
++        // one still in the model's active pattern, and an older one is likely a different
++        // block that merely shares a prefix. Start at len-n-1 so the tail cannot match
++        // itself and so at least one token follows the match.
++        for (long long s = len - n - 1; s >= 0; --s) {
++            if (std::memcmp(ctx.data() + s, pat, (std::size_t)n * sizeof(int)) != 0)
++                continue;
++            const long long from = s + n;
++            int d = 0;
++            for (long long t = from; t < len && d < max_draft; ++t, ++d)
++                out->push_back(ctx[(std::size_t)t]);
++            if (d > 0) return d;
++        }
++    }
++    return 0;
++}
++
++// Longest accepted prefix of a K-token verify pass, plus the bonus token.
++//
++// row_argmax(i) must return the argmax of verify-pass logits row i — the token that
++// truly follows batch position i. Draft i is accepted exactly when it equals that.
++// Called lazily and never past the first mismatch: each call scans a full 163840-wide
++// vocabulary row, and rows after a rejection describe a prefix that did not happen.
++//
++// Returns j, the number of accepted drafts, in [0, d]. *bonus receives the token
++// verified at row j; it came from a fully accepted prefix, so it is emitted whatever was
++// drafted — it is exactly the token a non-speculative step would have produced. The step
++// therefore emits j+1 tokens, and the state must be rolled back to index j.
++template <typename RowArgmax>
++inline int kimi_k3_spec_accept_prefix(const int* draft, int d, RowArgmax row_argmax,
++                                      int* bonus) {
++    int j = 0;
++    for (;;) {
++        const int a = row_argmax(j);
++        if (j < d && draft && a == draft[j]) { ++j; continue; }
++        if (bonus) *bonus = a;
++        return j;
++    }
++}
++
++}  // namespace sparkinfer
+diff --git a/runtime/examples/kimi_k3_spec_draft_check.cpp b/runtime/examples/kimi_k3_spec_draft_check.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/examples/kimi_k3_spec_draft_check.cpp
+@@ -0,0 +1,573 @@
++// Stage 4 host-side gates: the n-gram drafter, the accept/reject rule, the decode-loop
++// algebra that ties them together, and the K-token rank protocol frame.
++//
++// All CPU, no CUDA, no NCCL, no model. Everything tested here is logic that decides which
++// tokens get emitted and which state gets restored, and every one of its failure modes is
++// silent — an off-by-one in the accepted-prefix length emits a token the model never
++// verified, and a drafter that proposes the token AT the match instead of the one AFTER it
++// shifts the whole proposal one position and merely lowers acceptance. Neither shows up as
++// a crash on the fleet, so both are gated here where the answer is checkable by hand.
++//
++// The load-bearing test is D: a full speculative decode loop run against a deterministic
++// oracle must emit EXACTLY the sequence a plain greedy loop emits from the same oracle.
++// That is the property Stage 4 exists to deliver, stated in the one place it can be
++// checked exactly.
++
++#include "sparkinfer/models/kimi_k3_ngram_draft.h"
++#include "sparkinfer/tp/rank_protocol.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++using namespace sparkinfer;
++using namespace sparkinfer::tp::dist;
++
++namespace {
++
++int g_fail = 0;
++int g_pass = 0;
++
++void check(bool ok, const std::string& what) {
++    if (ok) {
++        ++g_pass;
++    } else {
++        ++g_fail;
++        std::printf("  FAIL: %s\n", what.c_str());
++    }
++}
++
++std::string vec_str(const std::vector<int>& v) {
++    std::string s = "[";
++    for (size_t i = 0; i < v.size(); ++i) {
++        if (i) s += ",";
++        s += std::to_string(v[i]);
++    }
++    return s + "]";
++}
++
++std::vector<int> draft_of(const std::vector<int>& ctx, int max_draft,
++                          const K3NgramDraftConfig& cfg) {
++    std::vector<int> out;
++    kimi_k3_ngram_draft(ctx, max_draft, cfg, &out);
++    return out;
++}
++
++// Independent restatement of the contract, written from the specification rather than
++// from the implementation: longest n first, most recent occurrence, the tokens AFTER it.
++// Deliberately the slow obvious version so a randomized comparison means something.
++std::vector<int> reference_draft(const std::vector<int>& ctx, int max_draft,
++                                 const K3NgramDraftConfig& cfg) {
++    std::vector<int> out;
++    if (max_draft <= 0 || ctx.empty()) return out;
++    const int len = (int)ctx.size();
++    for (int n = (cfg.n_max < len ? cfg.n_max : len); n >= cfg.n_min; --n) {
++        int best = -1;
++        for (int s = 0; s + n < len; ++s) {
++            bool eq = true;
++            for (int k = 0; k < n; ++k)
++                if (ctx[s + k] != ctx[len - n + k]) { eq = false; break; }
++            if (eq) best = s;  // keep scanning: the LAST hit is the most recent
++        }
++        if (best < 0) continue;
++        for (int t = best + n; t < len && (int)out.size() < max_draft; ++t)
++            out.push_back(ctx[t]);
++        if (!out.empty()) return out;
++    }
++    return out;
++}
++
++// ---------------------------------------------------------------------------
++// A — the drafter
++// ---------------------------------------------------------------------------
++void test_drafter() {
++    std::printf("[A] n-gram drafter\n");
++    // The SHIPPED default, gated here so a change to it is a deliberate act with a
++    // measurement behind it rather than something that silently alters every caller.
++    // n_min = 2 was measured on TP3: n_min = 1 cost freeform prose 12.5%.
++    {
++        K3NgramDraftConfig def;
++        check(def.n_max == 3 && def.n_min == 2, "A0 shipped default is n=[2,3]");
++    }
++    // Every case below pins the config it means instead of inheriting the default.
++    K3NgramDraftConfig c3;
++    c3.n_max = 3;
++    c3.n_min = 1;
++
++    {   // Nothing repeats: no match at any n, so no draft and the caller pays nothing.
++        const std::vector<int> ctx = {5, 6, 7, 8};
++        check(draft_of(ctx, 4, c3).empty(), "A1 distinct ctx must not draft");
++    }
++    {   // "1,2,3" recurs; what followed it last time was 4.
++        const std::vector<int> ctx = {1, 2, 3, 4, 9, 1, 2, 3};
++        const std::vector<int> d = draft_of(ctx, 3, c3);
++        check(d == std::vector<int>({4, 9, 1}), "A2 3-gram hit, got " + vec_str(d));
++    }
++    {   // No 3-gram, but "2,3" recurs. Must fall back rather than give up.
++        const std::vector<int> ctx = {7, 2, 3, 4, 5, 8, 2, 3};
++        const std::vector<int> d = draft_of(ctx, 2, c3);
++        check(d == std::vector<int>({4, 5}), "A3 fallback to n=2, got " + vec_str(d));
++    }
++    {   // Only a single token recurs.
++        const std::vector<int> ctx = {4, 9, 9, 9, 1, 2, 4};
++        const std::vector<int> d = draft_of(ctx, 1, c3);
++        check(d == std::vector<int>({9}), "A4 fallback to n=1, got " + vec_str(d));
++    }
++    {   // Two occurrences of "1,2": the RECENT one is followed by 7, the old one by 3.
++        // Picking the old one is the classic wrong-direction scan and is invisible except
++        // as lower acceptance, so it gets its own case.
++        const std::vector<int> ctx = {1, 2, 3, 4, 1, 2, 7, 8, 1, 2};
++        const std::vector<int> d = draft_of(ctx, 2, c3);
++        check(d == std::vector<int>({7, 8}), "A5 most recent occurrence, got " + vec_str(d));
++    }
++    {   // max_draft truncates; the tail is simply not proposed.
++        const std::vector<int> ctx = {1, 2, 3, 4, 5, 6, 1, 2, 3};
++        const std::vector<int> d = draft_of(ctx, 2, c3);
++        check(d == std::vector<int>({4, 5}), "A6 truncation to max_draft, got " + vec_str(d));
++    }
++    {   // The tail matching ITSELF is not a match: nothing follows it to propose.
++        const std::vector<int> ctx = {1, 2, 3};
++        check(draft_of(ctx, 3, c3).empty(), "A7 tail must not match itself");
++    }
++    {   // n_min excludes the short, low-quality matches.
++        const std::vector<int> ctx = {4, 9, 9, 9, 1, 2, 4};
++        K3NgramDraftConfig c2 = c3;
++        c2.n_min = 2;
++        check(draft_of(ctx, 2, c2).empty(), "A8 n_min=2 must reject a 1-gram match");
++    }
++    {   // Zero budget must not touch the output at all.
++        const std::vector<int> ctx = {1, 2, 1, 2};
++        check(draft_of(ctx, 0, c3).empty(), "A9 max_draft=0 draws no draft");
++    }
++    {   // ctx shorter than n_max must not read before the buffer.
++        const std::vector<int> ctx = {1};
++        check(draft_of(ctx, 4, c3).empty(), "A10 single-token ctx is safe");
++    }
++
++    // Randomized agreement with the independent reference, over a small alphabet so
++    // matches at every n actually occur.
++    unsigned s = 12345u;
++    auto rnd = [&]() { s = s * 1664525u + 1013904223u; return (int)((s >> 16) & 0x7fff); };
++    int mismatch = 0;
++    for (int trial = 0; trial < 4000; ++trial) {
++        const int len = 1 + rnd() % 40;
++        const int alpha = 2 + rnd() % 5;
++        std::vector<int> ctx((size_t)len);
++        for (int i = 0; i < len; ++i) ctx[(size_t)i] = rnd() % alpha;
++        K3NgramDraftConfig cfg;
++        cfg.n_max = 1 + rnd() % 4;
++        cfg.n_min = 1 + rnd() % cfg.n_max;
++        const int md = rnd() % 6;
++        if (draft_of(ctx, md, cfg) != reference_draft(ctx, md, cfg)) ++mismatch;
++    }
++    check(mismatch == 0,
++          "A11 randomized vs reference: " + std::to_string(mismatch) + " mismatches");
++    std::printf("     randomized cross-check: 4000 trials, %d mismatches\n", mismatch);
++}
++
++// ---------------------------------------------------------------------------
++// B — the accept/reject rule
++// ---------------------------------------------------------------------------
++void test_accept() {
++    std::printf("[B] accepted-prefix rule\n");
++    // rows[i] is the argmax the verify pass produced at row i.
++    auto run = [](const std::vector<int>& draft, const std::vector<int>& rows, int* bonus,
++                  int* calls) {
++        *calls = 0;
++        return kimi_k3_spec_accept_prefix(draft.data(), (int)draft.size(),
++                                          [&](int r) { ++(*calls); return rows[(size_t)r]; },
++                                          bonus);
++    };
++    int bonus = -1, calls = 0;
++
++    {   // Every draft right: j == d, and the bonus is the extra token the pass verified
++        // past the end of the drafts — the source of the "+1" in the speedup.
++        const int j = run({11, 12, 13}, {11, 12, 13, 14}, &bonus, &calls);
++        check(j == 3 && bonus == 14, "B1 full accept j=3 bonus=14");
++        check(calls == 4, "B1 evaluates exactly d+1 rows");
++    }
++    {   // First draft wrong: nothing is accepted but the verified token still lands, so
++        // a total miss is never worse than not drafting.
++        const int j = run({11, 12, 13}, {99, 12, 13, 14}, &bonus, &calls);
++        check(j == 0 && bonus == 99, "B2 total reject j=0 bonus=99");
++        check(calls == 1, "B2 must not evaluate rows past the rejection");
++    }
++    {   // Partial: rows after the mismatch describe a prefix that did not happen and are
++        // never consulted, which is also why they cost nothing.
++        const int j = run({11, 12, 13}, {11, 77, 13, 14}, &bonus, &calls);
++        check(j == 1 && bonus == 77, "B3 partial accept j=1 bonus=77");
++        check(calls == 2, "B3 stops at the mismatch");
++    }
++    {   // No draft at all still emits the verified token.
++        const int j = run({}, {42}, &bonus, &calls);
++        check(j == 0 && bonus == 42 && calls == 1, "B4 d=0 emits the verified token");
++    }
++    {   // A later row coincidentally matching does NOT resurrect the run.
++        const int j = run({11, 12, 13}, {11, 77, 13, 14}, &bonus, &calls);
++        check(j == 1, "B5 acceptance is a prefix, not a set");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// C — the K-token rank protocol frame
++// ---------------------------------------------------------------------------
++RankSpec make_spec(int rank) {
++    RankSpec s;
++    s.session_id = 7;
++    s.world_size = 3;
++    s.rank = rank;
++    s.local_device = 0;
++    s.n_experts = 896;
++    s.moe_ffn = 1536;
++    s.expert_block_elems = 256;
++    s.vocab = 163840;
++    s.model_digest[0] = 0xA5;
++    s.plan_digest[0] = 0x5A;
++    return s;
++}
++
++void test_protocol() {
++    std::printf("[C] K-token rank protocol\n");
++    {   // Round trip: ids and the deferred rollback index must survive the wire exactly.
++        Message m;
++        m.type = MessageType::Token;
++        m.session_id = 7;
++        m.sequence = 4;
++        m.rank = 1;
++        m.world_size = 3;
++        m.vocab = 163840;
++        m.phase = Phase::Step;
++        m.token_id = 101;
++        m.rollback_j = 2;
++        m.token_ids = {101, 202, 303, 404};
++        std::vector<std::uint8_t> frame;
++        std::string e;
++        check(encode_message(m, &frame, &e), "C1 encode K-token: " + e);
++        Message got;
++        check(decode_message(frame.data(), frame.size(), &got, &e), "C1 decode: " + e);
++        check(got.token_ids == m.token_ids, "C1 ids round-trip " + vec_str(got.token_ids));
++        check(got.rollback_j == 2, "C1 rollback_j round-trip");
++        check(got.token_id == 101, "C1 token_id round-trip");
++    }
++    {   // A v1-shaped frame (no ids) still round-trips and reads as a single-token step.
++        Message m;
++        m.type = MessageType::Token;
++        m.session_id = 7;
++        m.vocab = 163840;
++        m.phase = Phase::Step;
++        m.token_id = 55;
++        std::vector<std::uint8_t> frame;
++        std::string e;
++        check(encode_message(m, &frame, &e), "C2 encode scalar Token: " + e);
++        check(frame.size() == kWireHeaderBytes + kWireFixedPayloadBytes,
++              "C2 empty batch is exactly the fixed payload");
++        Message got;
++        check(decode_message(frame.data(), frame.size(), &got, &e), "C2 decode: " + e);
++        check(got.token_ids.empty() && got.token_id == 55 && got.rollback_j == -1,
++              "C2 scalar Token stays scalar");
++    }
++    {   // The leading id and the scalar must agree, or a reader that only understands the
++        // scalar would run a different token than the batch says.
++        Message m;
++        m.type = MessageType::Token;
++        m.session_id = 7;
++        m.vocab = 163840;
++        m.phase = Phase::Step;
++        m.token_id = 5;
++        m.token_ids = {6, 7};
++        std::vector<std::uint8_t> frame;
++        check(!encode_message(m, &frame, nullptr), "C3 encode rejects id/scalar mismatch");
++    }
++    {   // Bound on the batch width.
++        Message m;
++        m.type = MessageType::Token;
++        m.session_id = 7;
++        m.vocab = 163840;
++        m.phase = Phase::Step;
++        m.token_id = 1;
++        m.token_ids.assign((size_t)kMaxStepTokens + 1, 1);
++        std::vector<std::uint8_t> frame;
++        check(!encode_message(m, &frame, nullptr), "C4 encode rejects oversize batch");
++    }
++    {   // Corruption must not decode. A truncated tail is the shape a partial read takes.
++        Message m;
++        m.type = MessageType::Token;
++        m.session_id = 7;
++        m.vocab = 163840;
++        m.phase = Phase::Step;
++        m.token_id = 1;
++        m.token_ids = {1, 2, 3};
++        std::vector<std::uint8_t> frame;
++        check(encode_message(m, &frame, nullptr), "C5 encode ok");
++        std::vector<std::uint8_t> cut(frame.begin(), frame.end() - 4);
++        Message got;
++        check(!decode_message(cut.data(), cut.size(), &got, nullptr),
++              "C5 truncated frame rejected");
++        std::vector<std::uint8_t> grown = frame;
++        grown.push_back(0);
++        check(!decode_message(grown.data(), grown.size(), &got, nullptr),
++              "C5 extended frame rejected");
++        std::vector<std::uint8_t> flip = frame;
++        flip[flip.size() - 1] ^= 0xFF;
++        check(!decode_message(flip.data(), flip.size(), &got, nullptr),
++              "C5 corrupt payload rejected by CRC");
++    }
++    {   // Coordinator -> ranks, end to end, including the sequence gate.
++        Coordinator coord(make_spec(0));
++        std::vector<Message> out;
++        std::string e;
++        // Drive bootstrap to Ready the same way the transport does.
++        for (int r = 0; r < 3; ++r) {
++            Message hello;
++            RankSession s(make_spec(r));
++            check(s.hello(&hello, &e), "C6 hello");
++            AuthenticatedPeer p{r, (std::uint64_t)(r + 1)};
++            check(coord.accept(p, hello, &out, &e), "C6 accept hello: " + e);
++        }
++        NcclUniqueId id{};
++        id[0] = 9;
++        out.clear();
++        check(coord.install_nccl_unique_id(id, &out, &e), "C6 install id: " + e);
++        std::vector<RankSession> ranks;
++        for (int r = 0; r < 3; ++r) ranks.push_back(RankSession(make_spec(r)));
++        for (int r = 0; r < 3; ++r) {
++            Message hello;
++            check(ranks[(size_t)r].hello(&hello, &e), "C6 rank hello");
++        }
++        for (const Message& m : out) {
++            check(ranks[(size_t)m.rank].accept_control(m, nullptr, &e), "C6 nccl id: " + e);
++        }
++        out.clear();
++        for (int r = 0; r < 3; ++r) {
++            Message rdy;
++            check(ranks[(size_t)r].report_nccl_ready(true, 0, "", &rdy, &e), "C6 ready");
++            AuthenticatedPeer p{r, (std::uint64_t)(r + 1)};
++            check(coord.accept(p, rdy, &out, &e), "C6 accept ready: " + e);
++        }
++        for (const Message& m : out) {
++            check(ranks[(size_t)m.rank].accept_control(m, nullptr, &e), "C6 beginload: " + e);
++        }
++        out.clear();
++        for (int r = 0; r < 3; ++r) {
++            Message rdy;
++            check(ranks[(size_t)r].report_load_ready(true, 0, "", &rdy, &e), "C6 loadready");
++            AuthenticatedPeer p{r, (std::uint64_t)(r + 1)};
++            check(coord.accept(p, rdy, &out, &e), "C6 accept loadready: " + e);
++        }
++        check(coord.state() == CoordinatorState::Ready, "C6 coordinator Ready");
++
++        // The actual thing under test: one batch, one Token per rank, one sequence.
++        const int ids[4] = {10, 20, 30, 40};
++        out.clear();
++        check(coord.begin_step_multi(ids, 4, 2, &out, &e), "C6 begin_step_multi: " + e);
++        check(out.size() == 3, "C6 one Token per rank, not one per token");
++        for (const Message& m : out) {
++            std::vector<std::uint8_t> frame;
++            Message wire_m;
++            check(encode_message(m, &frame, &e) &&
++                      decode_message(frame.data(), frame.size(), &wire_m, &e),
++                  "C6 wire: " + e);
++            int tok = -1, rb = -1;
++            std::vector<int> got_ids;
++            check(ranks[(size_t)wire_m.rank].accept_control(wire_m, &tok, &e, &got_ids, &rb),
++                  "C6 accept Token: " + e);
++            check(tok == 10 && rb == 2 &&
++                      got_ids == std::vector<int>({10, 20, 30, 40}),
++                  "C6 rank sees the whole batch");
++        }
++        // A second batch before StepDone must still be refused — widening the frame must
++        // not have widened what the sequence gate lets through.
++        std::vector<Message> out2;
++        check(!coord.begin_step_multi(ids, 4, -1, &out2, nullptr),
++              "C6 sequence gate still closed before StepDone");
++    }
++    {   // The desync guard: a batch delivered to a caller that cannot receive it must be
++        // refused, not silently reduced to its first token.
++        RankSession s(make_spec(1));
++        Message hello;
++        std::string e;
++        s.hello(&hello, &e);
++        Message m;
++        m.type = MessageType::Token;
++        m.session_id = 7;
++        m.rank = 1;
++        m.world_size = 3;
++        m.local_device = 0;
++        m.n_experts = 896;
++        m.moe_ffn = 1536;
++        m.expert_block_elems = 256;
++        m.vocab = 163840;
++        m.model_digest[0] = 0xA5;
++        m.plan_digest[0] = 0x5A;
++        m.phase = Phase::Step;
++        m.token_id = 3;
++        m.token_ids = {3, 4};
++        int tok = -1;
++        check(!s.accept_control(m, &tok, nullptr, nullptr, nullptr),
++              "C7 multi-token Token with no batch sink is rejected");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// D — the whole loop, against a deterministic oracle
++// ---------------------------------------------------------------------------
++//
++// The engine guarantees causality (C1 in the Stage 3 receipt): verify row i depends only
++// on batch positions 0..i. Model that exactly with an oracle over the accepted prefix,
++// then assert the speculative loop emits the same tokens as plain greedy. Any error in
++// ctx maintenance, in the emitted count, or in the rollback index shows up here as a
++// divergent sequence.
++void test_loop_equivalence() {
++    std::printf("[D] speculative loop == greedy, against a fixed oracle\n");
++
++    // Two alphabets, and the pair is the point. A LAST-3 oracle over a WIDE alphabet
++    // rarely repeats a 3-gram, so almost every draft comes from a short uninformative
++    // match and is rejected — that exercises j == 0. Over a NARROW alphabet 3-grams recur
++    // constantly and, because the oracle is a function of exactly those 3 tokens, a
++    // 3-gram match predicts perfectly and whole chains are accepted — that exercises
++    // j == d. Running only the wide case would let this test pass while never once
++    // taking the accept branch, which is the branch that can emit an unverified token.
++    const int alphabets[2] = {4, 17};
++
++    long long saw_full = 0, saw_partial = 0, saw_none = 0, saw_accepted = 0;
++
++    for (int ai = 0; ai < 2; ++ai) {
++      const unsigned alpha = (unsigned)alphabets[ai];
++      auto oracle = [alpha](const std::vector<int>& consumed) {
++        unsigned h = 2166136261u;
++        const size_t n = consumed.size();
++        for (size_t i = (n >= 3 ? n - 3 : 0); i < n; ++i) {
++            h ^= (unsigned)consumed[i];
++            h *= 16777619u;
++        }
++        return (int)(h % alpha);
++      };
++
++      for (int K = 2; K <= 8; ++K) {
++        for (int nmin = 1; nmin <= 3; ++nmin) {
++            for (int seed = 0; seed < 6; ++seed) {
++                std::vector<int> prompt;
++                unsigned s = 1000u + (unsigned)seed * 77u;
++                const int plen = 3 + seed;
++                for (int i = 0; i < plen; ++i) {
++                    s = s * 1664525u + 1013904223u;
++                    prompt.push_back((int)((s >> 16) % 17u));
++                }
++                const int n_predict = 40;
++
++                // --- plain greedy reference ---
++                std::vector<int> ref, consumed = prompt;
++                {
++                    int next = oracle(consumed);
++                    ref.push_back(next);
++                    while ((int)ref.size() < n_predict) {
++                        consumed.push_back(next);
++                        next = oracle(consumed);
++                        ref.push_back(next);
++                    }
++                }
++
++                // --- speculative loop, same structure as the decode loop ---
++                K3NgramDraftConfig cfg;
++                cfg.n_max = 3;
++                cfg.n_min = nmin;
++                std::vector<int> got, ctx = prompt, spec_consumed = prompt;
++                long long steps = 0, sum_d = 0, sum_j = 0;
++                int next = oracle(spec_consumed);
++                got.push_back(next);
++                ctx.push_back(next);
++                while ((int)got.size() < n_predict) {
++                    const int budget = n_predict - (int)got.size();
++                    int max_draft = K - 1;
++                    if (max_draft > budget - 1) max_draft = budget - 1;
++                    std::vector<int> draft;
++                    const int d = max_draft > 0
++                        ? kimi_k3_ngram_draft(ctx, max_draft, cfg, &draft) : 0;
++
++                    // The verify pass: row i is the oracle over the accepted prefix
++                    // through batch position i. This IS the causality guarantee.
++                    std::vector<int> rows;
++                    {
++                        std::vector<int> walk = spec_consumed;
++                        walk.push_back(next);
++                        rows.push_back(oracle(walk));
++                        for (int i = 0; i < d; ++i) {
++                            walk.push_back(draft[(size_t)i]);
++                            rows.push_back(oracle(walk));
++                        }
++                    }
++                    int bonus = -1;
++                    const int j = kimi_k3_spec_accept_prefix(
++                        draft.data(), d, [&](int r) { return rows[(size_t)r]; }, &bonus);
++
++                    spec_consumed.push_back(next);
++                    for (int i = 0; i < j; ++i) {
++                        spec_consumed.push_back(draft[(size_t)i]);
++                        ctx.push_back(draft[(size_t)i]);
++                        got.push_back(draft[(size_t)i]);
++                    }
++                    got.push_back(bonus);
++                    next = bonus;
++                    ctx.push_back(next);
++
++                    ++steps;
++                    sum_d += d;
++                    sum_j += j;
++                    if (d > 0) {
++                        if (j == d) ++saw_full;
++                        else if (j > 0) ++saw_partial;
++                        else ++saw_none;
++                    }
++                    saw_accepted += j;
++                    if (steps > 4 * n_predict) break;  // livelock guard
++                }
++
++                const std::string tag = "D a=" + std::to_string(alpha) + " K=" +
++                                        std::to_string(K) + " nmin=" +
++                                        std::to_string(nmin) + " seed=" +
++                                        std::to_string(seed);
++                check(got.size() == ref.size(), tag + " emitted count " +
++                                                    std::to_string(got.size()) + " vs " +
++                                                    std::to_string(ref.size()));
++                check(got == ref, tag + " sequence differs from greedy");
++                // ctx must equal everything consumed plus the one pending token, or the
++                // drafter is being fed a history the model never saw.
++                check(ctx.size() == spec_consumed.size() + 1, tag + " ctx/consumed skew");
++                check(steps <= (long long)n_predict, tag + " speculation must not add steps");
++                if (K == 8 && nmin == 1 && seed == 0) {
++                    std::printf("     alphabet=%u K=8 nmin=1: %lld steps for %d tokens, "
++                                "drafted=%lld accepted=%lld (%.1f%%)\n",
++                                alpha, steps, n_predict, sum_d, sum_j,
++                                sum_d ? 100.0 * (double)sum_j / (double)sum_d : 0.0);
++                }
++            }
++        }
++      }
++    }
++
++    // Equivalence alone is satisfiable by a loop that accepts nothing and falls back to
++    // one token per step every time. These pin that all three arms actually ran, so a
++    // regression that silently disables acceptance fails here instead of quietly costing
++    // the entire speedup while every correctness gate stays green.
++    std::printf("     arms exercised: full=%lld partial=%lld none=%lld accepted=%lld\n",
++                saw_full, saw_partial, saw_none, saw_accepted);
++    check(saw_accepted > 0, "D accept path never taken");
++    check(saw_full > 0, "D full-accept arm (rollback no-op) never taken");
++    check(saw_partial > 0, "D partial-accept arm (real rollback) never taken");
++    check(saw_none > 0, "D total-reject arm never taken");
++}
++
++}  // namespace
++
++int main() {
++    std::printf("kimi_k3_spec_draft_check — Stage 4 host-side gates\n\n");
++    test_drafter();
++    test_accept();
++    test_protocol();
++    test_loop_equivalence();
++    std::printf("\n%s  passed=%d failed=%d\n", g_fail == 0 ? "ALL PASS" : "**FAILURES**",
++                g_pass, g_fail);
++    return g_fail == 0 ? 0 : 1;
++}
