@@ -12,10 +12,12 @@ d3d01a5b52188c221a2ffb87c52bf6e7b4ca84a402ad69055c8b1335302d55cc *sparkinfer/nex
 d568d323895722a75620fd20fdec198b122f134c567714211176f9cf6defcef9 *sparkinfer/next/0012-tp-finish-ack-after-wait-token.patch
 403682d64c15e3d2a45ab92cf0cec1a878c5344f2862891d2e4bba27d3c60d3a *sparkinfer/next/0013-tp-pin-per-tensor-host-memory-for-fast-load.patch
 eefc89dbde25b63f54eac834d5a471a3100329906d2386aa3a2378a01ec36a57 *sparkinfer/next/0014-tp-serve-mode-for-dynamic-prompt-requests.patch
+974bec3d7d7bbed8b4dcdf009dcebbc8c2105d9b3f3ce31a56558e1a25f085ed *sparkinfer/next/0015-tp-multi-prompt-file-and-kv-reset-sentinel.patch
 8d20f5aed6181346ae7e8eaa4f18c63a6870299fddccd14c81d2ebda29d5822b *sparkinfer/next/0016-tp-repetition-guard-for-greedy-decode.patch
 3633639be03b595fc1e8c8c7704a576a5cb3544f60fe0f94dcf83e9871200248 *sparkinfer/next/0017-test-fix-three-bugs-in-kimi-k3-state-check.patch
-954fc300ce9921081b7e9ee14ff1837f16ca02312619715b856d7a1ea78a4ba3 *sparkinfer/next/0018-tp-attention-shard-kill-switches-for-dist-path.patch
+38f29e5b76265ef7a6677e675d67c9cd0d9042ebb93b81e5a39822baca4884d0 *sparkinfer/next/0018-tp-attention-shard-kill-switches-for-dist-path.patch
 59a1bf364d1c51a45a13c586128f954038168bf942bae9ddebd810a2efc39005 *sparkinfer/next/0019-tp-probe-gguf-capability-flags-in-dist-rank-load.patch
+aacb370aa8d9ce659a131a5540ee5c6797072e01ec031c381fa5b6ee939a6138 *sparkinfer/next/0019a-tp-dist-phase-profiler.patch
 280965301eae628ceee28e7056f1f08a74b307022747ca01fcb57a01285921e7 *sparkinfer/next/0020-tp-per-layer-dump-instrumentation-for-dist-path.patch
 28186580cae7f83e6ace0258a1ab4718a1d08974d6a5e09be34982767b921c8b *sparkinfer/next/0021-tp-specdec-stages-0-2-batched-verify.diff
 d49d11dae0cd1896c9add2283bf05ba84f2532c4d9cd60022da4258dc488a3e8 *sparkinfer/next/0022-tp-specdec-ar-count-determinism-diagnostic.diff
