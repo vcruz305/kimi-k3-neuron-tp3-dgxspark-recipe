@@ -112,12 +112,12 @@ a `tools` declaration, both independently and via `apply_chat_template`.
 
 ## Build
 
-### 1. SparkInfer with patch 0014
+### 1. SparkInfer with the verified patch chain
 
-Follow `APPLY.md` as usual through `0014-tp-serve-mode-for-dynamic-prompt-requests.patch`
-(now included in the `git am` chain), then build `kimi_k3_dist_generate` the
-normal way. Copy the built binary + `.so`s to every rank as usual (see
-`APPLY.md` / `DETAILS.md`).
+Follow `APPLY.md`'s complete 27-patch chain through 0025. Patch 0014 introduces
+`--serve`; patches 0021–0025 are merged with it and were verified in a real two-request
+serve test. Build `kimi_k3_dist_generate` normally and copy the same binary + `.so`s to
+every rank (see `APPLY.md` / `DETAILS.md`).
 
 ### 2. Python wrapper
 
@@ -140,7 +140,9 @@ Rank 0 (same env/flags as a normal launch, `--serve` instead of `--prompts-file`
   --model "$MODEL" --serve 127.0.0.1:29600 --max-ctx 8192
 ```
 
-Ranks 1-2: unchanged, same as any other launch (`--coord HOST:29500`).
+Ranks 1-2 use the normal worker launch (`--coord HOST:29500`) at the exact same patch
+level. If rank0 uses `--spec-draft K`, pass the same value on every worker so each rank's
+rollback ring is armed; see the top-level README for the measured tuning flags.
 
 Once rank0 logs `serve mode listening on 127.0.0.1:29600`, start the wrapper
 (same host as rank0, since `--serve` binds loopback by default):
@@ -196,8 +198,23 @@ non-standard `reasoning_content` delta field when `"thinking": true` is set).
 
 ## Status
 
-**Plumbing verified end-to-end on the real 3-Spark fleet. Output quality is
-currently broken, and not by this wrapper.**
+**Current status: working and verified on the real 3-Spark fleet.** The complete chain
+through 0025 applies cleanly from the pinned base. The merged serve + speculative-decoding
+path was rebuilt on GB10 and exercised with two sequential requests: request 1 streamed
+16 tokens, request 2 forced the distributed KV/KDA reset and returned 16 tokens, then all
+ranks shut down cleanly. Both client and driver checks passed.
+
+The earlier degenerate-output investigation below was resolved by patch 0019: the
+distributed rank loader had never populated the GGUF capability flags, so real
+shared-expert, routed-normalization, and MLA-gate computation was silently omitted. That
+was an engine bug, not an API-wrapper, tokenizer, template, or quantization limitation.
+Ordinary greedy decode retains the repetition guard; speculative verification deliberately
+bypasses it so literal repetition remains draftable. See the top-level README and
+`evidence/specdec-serve-merge-RECEIPT.md` for current performance and test evidence.
+
+### Historical investigation (resolved by patch 0019)
+
+**The following text records the state before the root cause was known; it is not current.**
 
 What was run for real: patch 0014 applied (plain `git apply`, not `git am` --
 see note below), incremental rebuild, all 3 ranks loaded clean in serve mode,
@@ -290,11 +307,7 @@ than continuing to guess; next step is likely a reference comparison
 quantization ceiling. See the session's fleet-test report for the live
 discussion and whatever comes out of it.
 
-Also worth noting for future test runs: the patch was authored against a
-snapshot of `kimi_k3_dist_generate.cpp` that turned out to be the *current
-uncommitted working tree*, not the committed 0013 tip (771a1f1) -- that tip
-is missing the multi-prompt/KV-reset feature entirely, which exists only as
-uncommitted work. `git am` fails against that dirty tree (blob-hash mismatch
-on its 3-way fallback); plain `git apply` succeeds (pure context match, no
-merge needed). Worth committing that multi-prompt/KV-reset work at some point
-so `git am` works normally again.
+That investigation also exposed an uncaptured multi-prompt/KV-reset dependency between
+0013 and 0014. It is now patch 0015, including the protocol-side `-2` reset-sentinel
+allowances. The complete series no longer needs a dirty-tree `git apply` workaround;
+the documented 27-patch order succeeds with plain `git am`.

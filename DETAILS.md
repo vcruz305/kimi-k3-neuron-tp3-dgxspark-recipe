@@ -3,6 +3,13 @@
 Full supporting data for the top-level [`README.md`](README.md). Everything here is
 measured on real hardware, not modeled.
 
+> **Historical-results warning:** the TP3/TP4 throughput tables below predate the patch
+> 0019 correctness fix and were measured while the distributed engine silently skipped
+> real computation. Keep them for investigation history only; do not cite them as current
+> performance. The current corrected-engine bracketed measurement is in README's
+> [Speculative decoding](README.md#speculative-decoding-experimental-opt-in) section and
+> `evidence/specdec-serve-merge-RECEIPT.md`.
+
 ---
 
 ## Benchmarks (measured on real Sparks)
@@ -138,9 +145,10 @@ Entry shard:
 $HOME/models/kimi-k3-neuron-iq1s-local/k3-neuron-iq1s-00001-of-00009.gguf
 ```
 
-### 2. Build + apply patches 0001–0013
+### 2. Build + apply the verified chain through 0025
 
-See **[`APPLY.md`](APPLY.md)**. Build targets should include `kimi_k3_dist_generate` and ship:
+See **[`APPLY.md`](APPLY.md)** and use its exact 27-patch order from the pinned base.
+Build targets should include `kimi_k3_dist_generate` and ship:
 
 ```text
 kimi_k3_dist_generate

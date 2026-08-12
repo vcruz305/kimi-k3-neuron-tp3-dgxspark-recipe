@@ -1,4 +1,4 @@
-From d33730dd8492093566beba321c707e64c9e68ed2 Mon Sep 17 00:00:00 2001
+From 61f7051678ab7f75dbf5d4883e602dd2cbe5c593 Mon Sep 17 00:00:00 2001
 From: Victor <victor@local>
 Date: Mon, 10 Aug 2026 23:30:00 -0700
 Subject: [PATCH] tp: 0015 multi-prompt --prompts-file and the KV-reset
@@ -47,7 +47,8 @@ bit-identical to baseline, so it is not implicated in the capability-flags
 defect 0019 fixed.
 ---
  runtime/examples/kimi_k3_dist_generate.cpp | 205 ++++++++++++++++-----
- 1 file changed, 156 insertions(+), 49 deletions(-)
+ runtime/src/tp/rank_protocol.cpp           |   6 +-
+ 2 files changed, 160 insertions(+), 51 deletions(-)
 
 diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
 index b1b93c3..f8604af 100644
@@ -331,6 +332,30 @@ index b1b93c3..f8604af 100644
          if (!kimi_k3_dist_forward_token(dist, *coll, tok, nullptr, &err)) {
              wtr.report_step_done(false, 1, err, nullptr);
              std::fprintf(stderr, "forward: %s\n", err.c_str());
+diff --git a/runtime/src/tp/rank_protocol.cpp b/runtime/src/tp/rank_protocol.cpp
+index a68b916..1ff2d58 100644
+--- a/runtime/src/tp/rank_protocol.cpp
++++ b/runtime/src/tp/rank_protocol.cpp
+@@ -507,7 +507,8 @@ bool Coordinator::begin_step(int token_id, std::vector<Message>* outbound,
+     }
+     if (!outbound) return abort_cluster(Phase::Step, -15,
+                                         "token broadcast has no outbound sink", outbound, error);
+-    if (token_id < 0 || token_id >= cluster_.vocab)
++    // token_id == -2 is the multi-prompt KV-reset sentinel (not a vocab id).
++    if (!(token_id == -2) && (token_id < 0 || token_id >= cluster_.vocab))
+         return abort_cluster(Phase::Step, -16, "token id outside vocabulary", outbound, error);
+     std::fill(step_done_.begin(), step_done_.end(), 0);
+     for (int rank = 0; rank < cluster_.world_size; ++rank) {
+@@ -636,7 +637,8 @@ bool RankSession::accept_control(const Message& m, int* token_id, std::string* e
+                 return reject("Token carries the wrong protocol phase", error);
+             if (m.status != 0)
+                 return reject("Token carries a nonzero status", error);
+-            if (m.token_id < 0 || m.token_id >= spec_.vocab)
++            // Allow -2 KV-reset sentinel used by multi-prompt generate.
++            if (!(m.token_id == -2) && (m.token_id < 0 || m.token_id >= spec_.vocab))
+                 return reject("Token id outside vocabulary", error);
+             if (!token_id) return reject("Token has no output sink", error);
+             *token_id = m.token_id;
 -- 
 2.52.0.windows.1
 

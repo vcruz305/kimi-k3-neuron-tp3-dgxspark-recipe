@@ -1,0 +1,889 @@
+From 468c5b8373ac91877d670d2f6d9ce94da64c3908 Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 22:37:35 -0700
+Subject: [PATCH] tp: 0025 confidence gating and distributed head banding
+
+---
+ runtime/CMakeLists.txt                        |   6 +
+ runtime/examples/kimi_k3_dist_generate.cpp    |  72 ++++-
+ runtime/examples/kimi_k3_tune_check.cpp       | 261 ++++++++++++++++++
+ .../include/sparkinfer/models/k3_head_band.h  |  34 ++-
+ .../sparkinfer/models/kimi_k3_ngram_draft.h   | 119 +++++++-
+ runtime/src/models/k3_head_band.cpp           |  27 ++
+ runtime/src/models/kimi_k3_dist_forward.cpp   | 115 +++++++-
+ runtime/src/models/kimi_k3_dist_rank.cpp      |   9 +-
+ 8 files changed, 610 insertions(+), 33 deletions(-)
+ create mode 100644 runtime/examples/kimi_k3_tune_check.cpp
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index a560851..67d1f7d 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -192,6 +192,12 @@ add_executable(kimi_k3_tp_check examples/kimi_k3_tp_check.cpp)
+     target_link_libraries(kimi_k3_spec_draft_check PRIVATE sparkinfer_runtime CUDA::cudart)
+     set_target_properties(kimi_k3_spec_draft_check PROPERTIES CXX_STANDARD 17)
+ 
++    # Tuning gates on top of Stage 4: drafter confidence gating and the uneven head
++    # band. Same shape as the gate above — no CUDA, no model, no fleet.
++    add_executable(kimi_k3_tune_check examples/kimi_k3_tune_check.cpp)
++    target_link_libraries(kimi_k3_tune_check PRIVATE sparkinfer_runtime CUDA::cudart)
++    set_target_properties(kimi_k3_tune_check PROPERTIES CXX_STANDARD 17)
++
+     add_executable(kimi_k3_tp_width_check examples/kimi_k3_tp_width_check.cpp)
+     target_link_libraries(kimi_k3_tp_width_check PRIVATE sparkinfer_runtime CUDA::cudart)
+     set_target_properties(kimi_k3_tp_width_check PROPERTIES CXX_STANDARD 17)
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+index 48a8a0b..6cefc88 100644
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -66,6 +66,8 @@ void usage(const char* argv0) {
+                  "          [--spec-rollback K] [--spec-cont N]   # Stage 3 rollback gates\n"
+                  "          [--spec-draft K]     # Stage 4 n-gram speculative decode, batch width K\n"
+                  "          [--spec-ngram-max N] [--spec-ngram-min N]   # default 3 / 1\n"
++                 "          [--spec-min-occur N] [--spec-require-agree]  # match-confidence gate\n"
++                 "          [--spec-weak-draft N]   # width cap for a low-confidence match\n"
+                  "\n"
+                  "  KV reset sentinel token id = -2 (broadcast between multi-prompts).\n"
+                  "  --spec-bench and --spec-rollback exchange no control messages, so\n"
+@@ -725,6 +727,12 @@ int main(int argc, char** argv) {
+             ngram_cfg.n_max = std::atoi(need("--spec-ngram-max"));
+         else if (!std::strcmp(argv[i], "--spec-ngram-min"))
+             ngram_cfg.n_min = std::atoi(need("--spec-ngram-min"));
++        else if (!std::strcmp(argv[i], "--spec-min-occur"))
++            ngram_cfg.min_occurrences = std::atoi(need("--spec-min-occur"));
++        else if (!std::strcmp(argv[i], "--spec-require-agree"))
++            ngram_cfg.require_agreement = true;
++        else if (!std::strcmp(argv[i], "--spec-weak-draft"))
++            ngram_cfg.weak_max_draft = std::atoi(need("--spec-weak-draft"));
+         else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
+             usage(argv[0]);
+             return 0;
+@@ -760,6 +768,16 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "need 1 <= --spec-ngram-min <= --spec-ngram-max\n");
+             return 2;
+         }
++        if (ngram_cfg.min_occurrences < 1) {
++            std::fprintf(stderr, "--spec-min-occur must be >= 1\n");
++            return 2;
++        }
++        if (ngram_cfg.weak_max_draft >= spec_draft) {
++            // A weak cap at or above the full width is not a cap, and reads as one.
++            std::fprintf(stderr, "--spec-weak-draft %d must be < --spec-draft %d\n",
++                         ngram_cfg.weak_max_draft, spec_draft);
++            return 2;
++        }
+         // forward_batch sizes its scratch from PREFILL_CHUNK and refuses a wider batch.
+         // Checked here rather than discovered as a mid-generation failure on one rank.
+         int chunk = 64;
+@@ -943,13 +961,22 @@ int main(int argc, char** argv) {
+         std::vector<float> batch_logits;
+         std::vector<long long> spec_drafted_at, spec_accepted_at;
+         long long spec_steps = 0, spec_draft_steps = 0, spec_sum_d = 0, spec_sum_j = 0;
++        // Drafted/accepted split by the tail length that matched and by whether the match
++        // cleared the confidence bar. Stage 4 reported only a single pooled acceptance,
++        // which cannot answer "is a rarer long match better than a common short one" —
++        // the question that decides where the gate belongs. Indexed by n, capped at 7.
++        long long spec_n_drafted[8] = {0}, spec_n_accepted[8] = {0}, spec_n_steps[8] = {0};
++        long long spec_weak_drafted = 0, spec_weak_accepted = 0, spec_weak_steps = 0;
+         if (spec_draft > 0) {
+             kimi_k3_dist_set_rollback(dist, true);
+             batch_logits.assign((size_t)spec_draft * (size_t)dist.cfg.vocab, 0.0f);
+             spec_drafted_at.assign((size_t)spec_draft, 0);
+             spec_accepted_at.assign((size_t)spec_draft, 0);
+-            std::printf("[spec-draft] ON K=%d ngram n=[%d,%d]\n", spec_draft,
+-                        ngram_cfg.n_min, ngram_cfg.n_max);
++            std::printf("[spec-draft] ON K=%d ngram n=[%d,%d] min_occur=%d agree=%d "
++                        "weak_draft=%d\n",
++                        spec_draft, ngram_cfg.n_min, ngram_cfg.n_max,
++                        ngram_cfg.min_occurrences, ngram_cfg.require_agreement ? 1 : 0,
++                        ngram_cfg.weak_max_draft);
+             std::fflush(stdout);
+         }
+ 
+@@ -1287,8 +1314,9 @@ int main(int argc, char** argv) {
+                     if (max_draft > budget - 1) max_draft = budget - 1;
+ 
+                     draft.clear();
++                    K3NgramDraftInfo dinfo;
+                     const int d = max_draft > 0
+-                        ? kimi_k3_ngram_draft(ctx, max_draft, ngram_cfg, &draft)
++                        ? kimi_k3_ngram_draft(ctx, max_draft, ngram_cfg, &draft, &dinfo)
+                         : 0;
+ 
+                     batch.assign((size_t)1, next);
+@@ -1337,11 +1365,25 @@ int main(int argc, char** argv) {
+                     pending_rb = ((int)batch.size() > 1) ? j : -1;
+ 
+                     ++spec_steps;
+-                    if (d > 0) ++spec_draft_steps;
++                    if (d > 0) {
++                        ++spec_draft_steps;
++                        const int ni = dinfo.n < 8 ? dinfo.n : 7;
++                        ++spec_n_steps[ni];
++                        spec_n_drafted[ni] += d;
++                        spec_n_accepted[ni] += j;
++                        if (dinfo.weak) {
++                            ++spec_weak_steps;
++                            spec_weak_drafted += d;
++                            spec_weak_accepted += j;
++                        }
++                    }
+                     spec_sum_d += d;
+                     spec_sum_j += j;
+-                    std::printf(" spec step=%lld d=%d acc=%d emit=%d total=%zu\n",
+-                                spec_steps, d, j, j + 1, generated.size());
++                    std::printf(" spec step=%lld d=%d acc=%d emit=%d total=%zu n=%d occ=%d"
++                                " agree=%d weak=%d\n",
++                                spec_steps, d, j, j + 1, generated.size(), dinfo.n,
++                                dinfo.occurrences, dinfo.agreed ? 1 : 0,
++                                dinfo.weak ? 1 : 0);
+                     std::fflush(stdout);
+                 }
+             } else {
+@@ -1401,6 +1443,24 @@ int main(int argc, char** argv) {
+                             dr, spec_accepted_at[(size_t)i],
+                             (double)spec_accepted_at[(size_t)i] / (double)dr);
+             }
++            // Split by matched tail length. A pooled acceptance hides the case this gate
++            // exists for: a long match that fires rarely and is usually wrong costs the
++            // same wide verify as a short one that is usually right.
++            for (int n = 1; n < 8; ++n) {
++                if (spec_n_drafted[n] == 0) continue;
++                std::printf("[spec-draft] n=%d steps=%lld drafted=%lld accepted=%lld "
++                            "p=%.4f\n", n, spec_n_steps[n], spec_n_drafted[n],
++                            spec_n_accepted[n],
++                            (double)spec_n_accepted[n] / (double)spec_n_drafted[n]);
++            }
++            if (spec_weak_steps > 0) {
++                std::printf("[spec-draft] weak(width-capped) steps=%lld drafted=%lld "
++                            "accepted=%lld p=%.4f\n", spec_weak_steps, spec_weak_drafted,
++                            spec_weak_accepted,
++                            spec_weak_drafted
++                                ? (double)spec_weak_accepted / (double)spec_weak_drafted
++                                : 0.0);
++            }
+             std::fflush(stdout);
+         }
+ 
+diff --git a/runtime/examples/kimi_k3_tune_check.cpp b/runtime/examples/kimi_k3_tune_check.cpp
+new file mode 100644
+index 0000000..82ebd81
+--- /dev/null
++++ b/runtime/examples/kimi_k3_tune_check.cpp
+@@ -0,0 +1,261 @@
++// Gates for the two tuning changes that sit on top of Stage 4:
++//
++//   E. Match-confidence gating and adaptive draft width in the n-gram drafter.
++//   F. Uneven head-band arithmetic for the distributed path.
++//
++// All CPU, no CUDA, no NCCL, no model.
++//
++// E is not a correctness gate in the sense D was — the drafter cannot change which tokens
++// are emitted, only how many verifies are wasted proposing them. What E must prove is that
++// the DEFAULT config still behaves exactly as Stage 4 did, because the shipped default is
++// the thing every prior measurement was taken against, and that the gate's predicate is
++// the one the measurements were modelled on.
++//
++// F IS a correctness gate, and a silent one. The three bands are summed into a zero-filled
++// buffer, so a gap leaves a row of logits at zero (a token that can never be argmax) and an
++// overlap doubles a row (a token that wins when it should not). Neither crashes; both would
++// read as a quality regression somewhere far away. The tiling property is therefore checked
++// exhaustively rather than at the one size TP3 happens to use.
++
++#include "sparkinfer/models/k3_head_band.h"
++#include "sparkinfer/models/kimi_k3_ngram_draft.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <vector>
++
++using namespace sparkinfer;
++
++namespace {
++
++int g_fail = 0;
++int g_pass = 0;
++
++void check(bool ok, const std::string& what) {
++    if (ok) {
++        ++g_pass;
++    } else {
++        ++g_fail;
++        std::printf("  FAIL: %s\n", what.c_str());
++    }
++}
++
++std::string vec_str(const std::vector<int>& v) {
++    std::string s = "[";
++    for (size_t i = 0; i < v.size(); ++i) {
++        if (i) s += ",";
++        s += std::to_string(v[i]);
++    }
++    return s + "]";
++}
++
++std::vector<int> draft_of(const std::vector<int>& ctx, int max_draft,
++                          const K3NgramDraftConfig& cfg, K3NgramDraftInfo* info = nullptr) {
++    std::vector<int> out;
++    kimi_k3_ngram_draft(ctx, max_draft, cfg, &out, info);
++    return out;
++}
++
++// ---------------------------------------------------------------------------
++// E. drafter confidence gating
++// ---------------------------------------------------------------------------
++void test_gating() {
++    std::printf("E. match-confidence gating and adaptive width\n");
++
++    K3NgramDraftConfig def;   // shipped default
++    check(def.min_occurrences == 1 && !def.require_agreement && def.weak_max_draft == 0,
++          "E0 default config is ungated (Stage 4 behaviour)");
++
++    // A tail that occurs exactly once earlier. Ungated this drafts; gated it must not,
++    // because a single occurrence carries no evidence the continuation repeats — the
++    // bucket that produced 0 accepted tokens out of 12 drafted across code and prose.
++    {
++        const std::vector<int> ctx = {1, 2, 7, 8, 9, 5, 6, 1, 2};
++        K3NgramDraftConfig c = def; c.n_min = 2; c.n_max = 2;
++        check(draft_of(ctx, 3, c) == std::vector<int>({7, 8, 9}),
++              "E1 ungated drafts a single-occurrence match");
++        K3NgramDraftInfo info;
++        c.min_occurrences = 2;
++        check(draft_of(ctx, 3, c, &info).empty(),
++              "E2 min_occurrences=2 declines a single-occurrence match");
++        check(info.n == 0, "E2 info reports nothing proposed");
++    }
++
++    // Two occurrences continuing the same way: the bucket that carried every accepted
++    // token. Must survive both gates, and must still draft from the MOST RECENT one —
++    // recurrence decides whether, recency still decides what.
++    {
++        const std::vector<int> ctx = {4, 4, 9, 1, 2, 3, 4, 4, 9, 7, 7, 4, 4};
++        K3NgramDraftConfig c = def; c.n_min = 2; c.n_max = 2;
++        c.min_occurrences = 2; c.require_agreement = true;
++        K3NgramDraftInfo info;
++        const std::vector<int> d = draft_of(ctx, 2, c, &info);
++        check(d == std::vector<int>({9, 7}), "E3 recurring+agreeing match drafts, got " + vec_str(d));
++        check(info.occurrences == 2 && info.agreed && !info.weak,
++              "E3 info: occ=2 agreed weak=0, got occ=" + std::to_string(info.occurrences));
++    }
++
++    // Two occurrences continuing DIFFERENTLY. Counting alone accepts it; agreement
++    // rejects it. This is the split that separated code's 0.85 bucket from its 0.00 one,
++    // so the two knobs are checked to be genuinely independent and not the same test.
++    {
++        const std::vector<int> ctx = {5, 5, 1, 0, 0, 5, 5, 2, 0, 0, 5, 5};
++        K3NgramDraftConfig c = def; c.n_min = 2; c.n_max = 2;
++        c.min_occurrences = 2;
++        K3NgramDraftInfo info;
++        const std::vector<int> d = draft_of(ctx, 1, c, &info);
++        check(d == std::vector<int>({2}), "E4 count-only gate admits a disagreeing match, got " + vec_str(d));
++        check(info.occurrences == 2 && !info.agreed, "E4 info records the disagreement");
++        c.require_agreement = true;
++        check(draft_of(ctx, 1, c).empty(), "E5 agreement gate rejects the same match");
++    }
++
++    // A declined long tail must fall through to a shorter one that does clear the bar,
++    // not abandon the step. Best-first still holds; the gate only removes candidates.
++    {
++        //          n=3 tail (8,1,2) occurs exactly once -> declined by the count bar;
++        //          n=2 tail (1,2) occurs twice, both continuing with 3 -> admitted.
++        const std::vector<int> ctx = {8, 1, 2, 3, 9, 9, 1, 2, 3, 4, 8, 1, 2};
++        K3NgramDraftConfig c = def; c.n_min = 2; c.n_max = 3;
++        c.min_occurrences = 2; c.require_agreement = true;
++        K3NgramDraftInfo info;
++        const std::vector<int> d = draft_of(ctx, 1, c, &info);
++        check(d == std::vector<int>({3}) && info.n == 2,
++              "E6 declined n=3 falls through to an admitted n=2, got " + vec_str(d) +
++                  " n=" + std::to_string(info.n));
++    }
++
++    // Adaptive width: a weak match is not declined, it is capped. The point is that a
++    // rejected 1-token draft costs one marginal position instead of three.
++    {
++        const std::vector<int> ctx = {1, 2, 7, 8, 9, 5, 6, 1, 2};
++        K3NgramDraftConfig c = def; c.n_min = 2; c.n_max = 2;
++        c.min_occurrences = 2; c.require_agreement = true; c.weak_max_draft = 1;
++        K3NgramDraftInfo info;
++        const std::vector<int> d = draft_of(ctx, 3, c, &info);
++        check(d == std::vector<int>({7}), "E7 weak match is width-capped, not declined, got " + vec_str(d));
++        check(info.weak, "E7 info flags the match as weak");
++    }
++
++    // A strong match under the same config must still get the full width, or the cap is
++    // not adaptive, it is just a smaller K.
++    {
++        const std::vector<int> ctx = {4, 4, 9, 7, 1, 4, 4, 9, 7, 2, 4, 4};
++        K3NgramDraftConfig c = def; c.n_min = 2; c.n_max = 2;
++        c.min_occurrences = 2; c.require_agreement = true; c.weak_max_draft = 1;
++        K3NgramDraftInfo info;
++        const std::vector<int> d = draft_of(ctx, 2, c, &info);
++        check(d == std::vector<int>({9, 7}) && !info.weak,
++              "E8 strong match keeps full width under a weak cap, got " + vec_str(d));
++    }
++
++    // The gated scan walks the whole history where the ungated one returns early. Both
++    // must pick the same occurrence when the gate admits everything, or the two arms are
++    // not the same drafter and every Stage 4 number stops applying to the default.
++    {
++        const std::vector<int> ctx = {3, 1, 5, 0, 3, 1, 6, 0, 3, 1};
++        K3NgramDraftConfig a = def; a.n_min = 2; a.n_max = 2;
++        K3NgramDraftConfig b = a; b.min_occurrences = 1; b.weak_max_draft = 1;
++        // b takes the gated arm (weak_max_draft > 0) but admits every match, so its
++        // "strong" verdict is the same and the width cap never binds.
++        check(draft_of(ctx, 1, a) == draft_of(ctx, 1, b),
++              "E9 gated and ungated arms choose the same occurrence when nothing is gated");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// F. uneven head band
++// ---------------------------------------------------------------------------
++void test_head_band() {
++    std::printf("F. uneven head-band arithmetic (distributed path)\n");
++
++    // The even helper is what the dist path could not use, and the reason this variant
++    // exists. Stated as a test so the motivation cannot quietly stop being true.
++    {
++        K3HeadBand hb;
++        check(!k3_head_band(163840, 163840ull * 14336, 3, 0, &hb),
++              "F0 even helper declines TP3 (163840 %% 3 != 0)");
++    }
++
++    // Exhaustive tiling. For every band the union must be exactly [0, vocab) with no gap
++    // and no overlap, and byte_off must equal offset * row_bytes.
++    {
++        const int vocabs[] = {163840, 32000, 7, 8, 9, 100, 101, 102, 1000003};
++        const int tps[] = {2, 3, 4, 5, 7, 8};
++        bool tiling_ok = true, bytes_ok = true, spread_ok = true;
++        int cases = 0;
++        for (int vocab : vocabs) {
++            for (int tp : tps) {
++                if (vocab < tp) continue;
++                const size_t row_bytes = 14336;
++                const size_t wb = (size_t)vocab * row_bytes;
++                int next = 0, min_rows = vocab, max_rows = 0;
++                for (int r = 0; r < tp; ++r) {
++                    K3HeadBand hb;
++                    if (!k3_head_band_uneven(vocab, wb, tp, r, &hb)) { tiling_ok = false; break; }
++                    if (hb.offset != next) tiling_ok = false;
++                    if (hb.byte_off != (size_t)hb.offset * row_bytes) bytes_ok = false;
++                    if (hb.rows < min_rows) min_rows = hb.rows;
++                    if (hb.rows > max_rows) max_rows = hb.rows;
++                    next = hb.offset + hb.rows;
++                }
++                if (next != vocab) tiling_ok = false;
++                // Bands may differ by at most one row, or the load is not balanced and
++                // the slowest rank sets the step time.
++                if (max_rows - min_rows > 1) spread_ok = false;
++                ++cases;
++            }
++        }
++        check(tiling_ok, "F1 bands tile [0,vocab) exactly, no gap or overlap (" +
++                             std::to_string(cases) + " cases)");
++        check(bytes_ok, "F2 byte_off == offset * row_bytes in every band");
++        check(spread_ok, "F3 band sizes differ by at most one row");
++    }
++
++    // The TP3 case by hand, because it is the one that actually ships.
++    {
++        const size_t wb = 163840ull * 14336;   // F16 head, 7168 cols
++        K3HeadBand a, b, c;
++        const bool ok = k3_head_band_uneven(163840, wb, 3, 0, &a) &&
++                        k3_head_band_uneven(163840, wb, 3, 1, &b) &&
++                        k3_head_band_uneven(163840, wb, 3, 2, &c);
++        check(ok, "F4 TP3 bands resolve");
++        check(a.rows == 54614 && b.rows == 54613 && c.rows == 54613,
++              "F5 TP3 rows are 54614/54613/54613, got " + std::to_string(a.rows) + "/" +
++                  std::to_string(b.rows) + "/" + std::to_string(c.rows));
++        check(a.offset == 0 && b.offset == 54614 && c.offset == 109227,
++              "F6 TP3 offsets are 0/54614/109227");
++        check(a.rows + b.rows + c.rows == 163840, "F7 TP3 bands sum to vocab");
++    }
++
++    // Declines. Each of these would otherwise build a pointer from bad arithmetic and
++    // read real weights belonging to other rows at full speed.
++    {
++        const size_t wb = 163840ull * 14336;
++        K3HeadBand hb;
++        check(!k3_head_band_uneven(163840, wb, 1, 0, &hb), "F8 declines tp_size=1");
++        check(!k3_head_band_uneven(163840, wb, 3, 3, &hb), "F9 declines rank out of range");
++        check(!k3_head_band_uneven(163840, wb, 3, -1, &hb), "F10 declines negative rank");
++        check(!k3_head_band_uneven(163840, wb + 1, 3, 0, &hb),
++              "F11 declines a weight whose bytes do not divide into rows");
++        check(!k3_head_band_uneven(163840, 0, 3, 0, &hb), "F12 declines zero-byte weight");
++        check(!k3_head_band_uneven(2, wb, 3, 0, &hb), "F13 declines vocab < tp_size");
++        check(!k3_head_band_uneven(163840, wb, 3, 0, nullptr), "F14 declines null out");
++    }
++}
++
++}  // namespace
++
++int main() {
++    // The toggle is read once into a function-local static, so it has to be set before the
++    // first call rather than between cases.
++    ::setenv("SPARKINFER_K3_DIST_HEAD_BAND", "1", 1);
++
++    std::printf("kimi_k3_tune_check — drafter gating + uneven head band\n\n");
++    test_gating();
++    std::printf("\n");
++    test_head_band();
++    std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
++    return g_fail == 0 ? 0 : 1;
++}
+diff --git a/runtime/include/sparkinfer/models/k3_head_band.h b/runtime/include/sparkinfer/models/k3_head_band.h
+index b831e68..08f727b 100644
+--- a/runtime/include/sparkinfer/models/k3_head_band.h
++++ b/runtime/include/sparkinfer/models/k3_head_band.h
+@@ -1,5 +1,3 @@
+-// Front door for the banded LM head.
+-//
+ // The head is the last thing a token does and the only thing in the model that ONE
+ // rank does alone: kimi_k3_tp.cpp runs output_norm + the 163840 x 7168 projection on
+ // rank 0 while the other seven H200s hold the identical hidden state and nothing to
+@@ -46,4 +44,36 @@ bool k3_head_band_enabled();
+ bool k3_head_band(int vocab, size_t weight_bytes, int tp_size, int rank,
+                   K3HeadBand* out);
+ 
++// ---------------------------------------------------------------------------
++// Distributed path
++// ---------------------------------------------------------------------------
++
++// SPARKINFER_K3_DIST_HEAD_BAND=1 turns head banding on in the distributed path.
++//
++// Deliberately a SEPARATE toggle from k3_head_band_enabled(), and deliberately default
++// OFF. The dist path's workers do not hold output.weight today, so this flag changes
++// what the LOADER reads as well as what the forward pass computes — every rank gains a
++// 2.35 GB F16 replica. Off by default keeps the A/B a flag flip on one binary and keeps
++// a default build's memory footprint exactly what it was.
++bool k3_dist_head_band_enabled();
++
++// UNEVEN band, for the distributed path.
++//
++// k3_head_band above declines unless tp_size divides vocab, which is right for the
++// single-process TP path it was written for. TP3 has vocab 163840 and tp_size 3, so it
++// always declines there and the head stays a rank-0 monopoly.
++//
++// This variant spreads the remainder one row at a time across the lowest-numbered ranks,
++// so band sizes differ by at most one row and the offsets remain exact integers. With
++// vocab 163840 over 3 ranks that is 54614 / 54613 / 54613, and the three bands tile
++// [0, vocab) exactly — which is the property the caller depends on, because the bands are
++// combined by summing a zero-filled full-width buffer and a gap or an overlap would be
++// silent rather than loud.
++//
++// Requires weight_bytes % vocab == 0 for the same reason the even variant does: a
++// fractional row stride rounds, and a pointer built from a rounded stride reads real
++// bytes belonging to other rows at full speed.
++bool k3_head_band_uneven(int vocab, size_t weight_bytes, int tp_size, int rank,
++                         K3HeadBand* out);
++
+ }  // namespace sparkinfer
+diff --git a/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h b/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h
+index 3ee5c41..19de03e 100644
+--- a/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h
++++ b/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h
+@@ -12,6 +12,11 @@
+ // Cost is a backward memcmp scan over a few thousand ints — microseconds, off the GPU and
+ // off the critical path. Header-only so the decode loop and its test share one definition
+ // rather than two that can drift.
++//
++// NOTHING HERE IS PART OF THE ACCEPT DECISION. This file only chooses what to propose;
++// kimi_k3_spec_accept_prefix below decides what is kept, by comparing against the verify
++// pass's own argmax. A drafter bug can therefore cost throughput but cannot change which
++// tokens are emitted — which is why the confidence rules can be tuned freely.
+ 
+ #include <cstddef>
+ #include <cstring>
+@@ -30,6 +35,47 @@ struct K3NgramDraftConfig {
+     // on code than n_min = 2 does. n_min = 3 is too shy: it drafts on 16% of steps and
+     // gives back most of the win. 2 is the measured optimum, not a guess.
+     int n_min = 2;
++
++    // ---- match confidence (default OFF: the two fields below reproduce Stage 4) ----
++    //
++    // Stage 4 trusted the single most recent occurrence of a matched n-gram. Replaying
++    // that drafter over Stage 4's own measured token streams shows the recent-occurrence
++    // heuristic is not the thing carrying the win — recurrence is:
++    //
++    //   bucket                          code            repeat        prose
++    //   >=2 occurrences, same cont.     0.85 (24 drft)  1.00 (32)     — never fires
++    //   >=2 occurrences, differing      0.00 (11 drft)  —             —
++    //   exactly 1 occurrence            0.00 ( 3 drft)  —             0.11 (9 drft)
++    //
++    // Every draft token that was ever accepted came from a repeated n-gram whose
++    // continuations agreed. The other two buckets contributed 23 wasted draft positions
++    // and not one accepted token. min_occurrences = 2 with require_agreement = true is
++    // therefore not a throughput/accuracy trade — on the measured data it discards only
++    // work that was going to be thrown away.
++    //
++    // Cost note: gating makes the scan count occurrences instead of returning on the
++    // first, so it walks the whole history per n instead of stopping early. At max_ctx
++    // 4096 and n_max 3 that is ~12k 12-byte memcmps, still microseconds, still off the
++    // critical path of a 162 ms step.
++    int  min_occurrences  = 1;      // >= 2 requires the n-gram to have recurred
++    bool require_agreement = false; // true also requires every occurrence to continue alike
++
++    // ---- adaptive width (default OFF) ----
++    //
++    // Instead of declining a low-confidence match outright, draft it at a reduced width.
++    // A rejected 1-token draft costs one marginal position (~21 ms) where a rejected
++    // 3-token draft costs three, so this bounds the downside of a bad guess without
++    // giving up its upside. <= 0 means "no cap": a weak match either drafts at full
++    // width (when the confidence bar is off) or is declined (when it is on).
++    int weak_max_draft = 0;
++};
++
++// What the scan found, for logging and tests. Never needed to use the draft.
++struct K3NgramDraftInfo {
++    int  n           = 0;      // matched tail length; 0 when nothing was proposed
++    int  occurrences = 0;      // earlier occurrences of that tail which had a successor
++    bool agreed      = false;  // all of them continued with the same token
++    bool weak        = false;  // failed the confidence bar and was width-capped
+ };
+ 
+ // Propose up to max_draft continuation tokens for ctx, appending them to *out.
+@@ -39,27 +85,78 @@ struct K3NgramDraftConfig {
+ // caller is about to feed — the drafter predicts what follows that token, so leaving it
+ // out shifts every proposal one position early.
+ inline int kimi_k3_ngram_draft(const std::vector<int>& ctx, int max_draft,
+-                               const K3NgramDraftConfig& cfg, std::vector<int>* out) {
++                               const K3NgramDraftConfig& cfg, std::vector<int>* out,
++                               K3NgramDraftInfo* info = nullptr) {
++    if (info) *info = K3NgramDraftInfo{};
+     if (!out || max_draft <= 0 || ctx.empty()) return 0;
+     const long long len = (long long)ctx.size();
+     const int n_hi = cfg.n_max < (int)len ? cfg.n_max : (int)len;
+     const int n_lo = cfg.n_min < 1 ? 1 : cfg.n_min;
+ 
++    const bool gating = cfg.min_occurrences > 1 || cfg.require_agreement ||
++                        cfg.weak_max_draft > 0;
++
++    // Emit `cap` tokens following the occurrence at s. Shared by both arms so the two
++    // cannot disagree about what a match proposes once it has been chosen.
++    auto emit = [&](long long s, int n, int cap) -> int {
++        int d = 0;
++        for (long long t = s + n; t < len && d < cap; ++t, ++d)
++            out->push_back(ctx[(std::size_t)t]);
++        return d;
++    };
++
+     for (int n = n_hi; n >= n_lo; --n) {
+         const int* pat = ctx.data() + (len - n);
+-        // Backward from the latest possible start, so the FIRST hit is the most recent
+-        // occurrence. Recency matters: in structured output the nearest repetition is the
+-        // one still in the model's active pattern, and an older one is likely a different
+-        // block that merely shares a prefix. Start at len-n-1 so the tail cannot match
+-        // itself and so at least one token follows the match.
++
++        if (!gating) {
++            // Stage 4 behaviour, byte for byte: backward from the latest possible start,
++            // so the FIRST hit is the most recent occurrence. Start at len-n-1 so the
++            // tail cannot match itself and so at least one token follows the match.
++            for (long long s = len - n - 1; s >= 0; --s) {
++                if (std::memcmp(ctx.data() + s, pat, (std::size_t)n * sizeof(int)) != 0)
++                    continue;
++                const int d = emit(s, n, max_draft);
++                if (d > 0) {
++                    if (info) { info->n = n; info->occurrences = 1; }
++                    return d;
++                }
++            }
++            continue;
++        }
++
++        // Gated: the whole history is walked so occurrences can be counted and their
++        // continuations compared. `first` stays the most recent occurrence — recency
++        // still decides WHAT is drafted; recurrence only decides WHETHER.
++        // The scan starts at len-n-1, so every hit has at least one successor token and
++        // the tail can never match itself.
++        long long first = -1;
++        int  cnt   = 0;
++        bool agree = true;
++        int  cont0 = 0;
+         for (long long s = len - n - 1; s >= 0; --s) {
+             if (std::memcmp(ctx.data() + s, pat, (std::size_t)n * sizeof(int)) != 0)
+                 continue;
+-            const long long from = s + n;
+-            int d = 0;
+-            for (long long t = from; t < len && d < max_draft; ++t, ++d)
+-                out->push_back(ctx[(std::size_t)t]);
+-            if (d > 0) return d;
++            const int c = ctx[(std::size_t)(s + n)];
++            if (cnt == 0) { first = s; cont0 = c; }
++            else if (c != cont0) agree = false;
++            ++cnt;
++        }
++        if (cnt == 0) continue;
++
++        const bool strong = cnt >= cfg.min_occurrences &&
++                            (!cfg.require_agreement || agree);
++        int cap = max_draft;
++        if (!strong) {
++            if (cfg.weak_max_draft <= 0) continue;  // decline; try a shorter tail
++            cap = cfg.weak_max_draft < max_draft ? cfg.weak_max_draft : max_draft;
++        }
++        const int d = emit(first, n, cap);
++        if (d > 0) {
++            if (info) {
++                info->n = n; info->occurrences = cnt; info->agreed = agree;
++                info->weak = !strong;
++            }
++            return d;
+         }
+     }
+     return 0;
+diff --git a/runtime/src/models/k3_head_band.cpp b/runtime/src/models/k3_head_band.cpp
+index 7747347..2102bdc 100644
+--- a/runtime/src/models/k3_head_band.cpp
++++ b/runtime/src/models/k3_head_band.cpp
+@@ -31,4 +31,31 @@ bool k3_head_band(int vocab, size_t weight_bytes, int tp_size, int rank,
+     return true;
+ }
+ 
++bool k3_dist_head_band_enabled() {
++    static const bool on = [] {
++        const char* e = std::getenv("SPARKINFER_K3_DIST_HEAD_BAND");
++        return e && e[0] == '1';
++    }();
++    return on;
++}
++
++bool k3_head_band_uneven(int vocab, size_t weight_bytes, int tp_size, int rank,
++                         K3HeadBand* out) {
++    if (!out) return false;
++    if (!k3_dist_head_band_enabled()) return false;
++    if (tp_size <= 1 || rank < 0 || rank >= tp_size) return false;
++    if (vocab < tp_size) return false;
++    if (weight_bytes == 0 || weight_bytes % (size_t)vocab != 0) return false;
++
++    // Ranks [0, rem) take one extra row each. Writing the offset as this sum rather
++    // than accumulating band sizes keeps it closed-form per rank, so rank r never has
++    // to agree with a loop rank r-1 ran.
++    const int base = vocab / tp_size;
++    const int rem  = vocab % tp_size;
++    out->rows     = base + (rank < rem ? 1 : 0);
++    out->offset   = rank * base + (rank < rem ? rank : rem);
++    out->byte_off = (size_t)out->offset * (weight_bytes / (size_t)vocab);
++    return out->rows > 0;
++}
++
+ }  // namespace sparkinfer
+diff --git a/runtime/src/models/kimi_k3_dist_forward.cpp b/runtime/src/models/kimi_k3_dist_forward.cpp
+index 5f42a2d..93872dd 100755
+--- a/runtime/src/models/kimi_k3_dist_forward.cpp
++++ b/runtime/src/models/kimi_k3_dist_forward.cpp
+@@ -1,6 +1,7 @@
+ #include "sparkinfer/models/kimi_k3_dist_forward.h"
+ 
+ #include "sparkinfer/kernels/kimi_k3.h"
++#include "sparkinfer/models/k3_head_band.h"
+ 
+ #include <cuda_runtime.h>
+ 
+@@ -72,9 +73,26 @@ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
+     return k3k::dequant_f32_by_type(x, base, cfg.hidden, w.token_embd.type, stream);
+ }
+ 
++// This rank's slice of output.weight, or a decline (returns false) when the dist path is
++// not banding the head and rank 0 keeps the whole projection.
++//
++// Every consumer — the logits allocation, the projection, and the combine — derives the
++// band from this one call. Deriving it twice is exactly how a band and the buffer it
++// writes into come to disagree, and the failure is a wrong row of logits rather than a
++// crash. `weights.output` is only populated on a rank the loader gave the head to, so an
++// unbanded worker declines here on the first test rather than on the arithmetic.
++bool dist_head_band(const KimiK3DistRank& rank, K3HeadBand* out) {
++    if (!rank.weights.output.ok()) return false;
++    return k3_head_band_uneven(rank.cfg.vocab, (size_t)rank.weights.output.n_bytes,
++                               rank.plan.spec.world_size, rank.plan.spec.rank, out);
++}
++
+ bool ensure_logits(KimiK3DistRank& rank) {
+     if (rank.logits) return true;
+-    if (rank.plan.spec.rank != 0) return true;
++    // Banded, every rank projects a slice into a full-width buffer and the slices are
++    // summed, so a worker needs the whole vocab row too — not just its band.
++    K3HeadBand hb;
++    if (rank.plan.spec.rank != 0 && !dist_head_band(rank, &hb)) return true;
+     if (cudaMalloc(&rank.logits, (size_t)rank.cfg.vocab * sizeof(float)) != cudaSuccess)
+         return false;
+     return true;
+@@ -452,7 +470,21 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+         }
+     }
+ 
+-    if (my_rank == 0) {
++    // HEAD-BAND SHARDING (SPARKINFER_K3_DIST_HEAD_BAND=1).
++    //
++    // Unbanded, rank 0 alone streams the whole 2.349 GB F16 head while ranks 1 and 2 sit
++    // idle holding the identical hidden state — the head is the only part of a token that
++    // one rank does alone, and it is fully exposed because the driver blocks on rank 0
++    // immediately afterwards. Banded, each rank projects ~1/3 of the vocabulary rows into
++    // a zero-filled full-width buffer and one all-reduce sums the three disjoint slices.
++    //
++    // The sum is EXACT, not approximate: every element has exactly one non-zero
++    // contributor, and x + 0 + 0 == x in IEEE754 for every value a logit can take. That
++    // is what makes this a latency change and not a numerics change, and it is what the
++    // equivalence test pins.
++    K3HeadBand hb;
++    const bool banded = dist_head_band(rank, &hb);
++    if (my_rank == 0 || banded) {
+         auto run_head = [&]() {
+             if (!ensure_logits(rank)) {
+                 set_err(error, "logits cudaMalloc failed");
+@@ -474,14 +506,28 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+             }
+             k3k::rms_norm_f32(rank.x_next, rank.x, (const float*)w.output_norm.data, H,
+                               cfg.rms_eps, rank.stream);
+-            if (!k3k::k3_proj_f32(rank.logits, rank.x_next, w.output.data, w.output.type,
+-                                  cfg.vocab, H, rank.stream)) {
++            if (banded) {
++                // Zero first: the rows outside this rank's band are this rank's
++                // contribution to them, and the sum needs that contribution to be 0.
++                // Skipping this reduces whatever the last token left in the buffer.
++                if (cudaMemsetAsync(rank.logits, 0, (size_t)cfg.vocab * sizeof(float),
++                                    rank.stream) != cudaSuccess) {
++                    set_err(error, "logits band zero failed");
++                    return false;
++                }
++                if (!k3k::k3_proj_f32(rank.logits + hb.offset, rank.x_next,
++                                      (const void*)((const char*)w.output.data + hb.byte_off),
++                                      w.output.type, hb.rows, H, rank.stream)) {
++                    set_err(error, "lm head band proj failed");
++                    return false;
++                }
++            } else if (!k3k::k3_proj_f32(rank.logits, rank.x_next, w.output.data,
++                                         w.output.type, cfg.vocab, H, rank.stream)) {
+                 set_err(error, "lm head proj failed");
+                 return false;
+             }
+             if (dump_on) {
+                 k3_dump_dev("result_norm", -1, dump_step, my_rank, rank.x_next, H, rank.stream);
+-                k3_dump_dev("logits", -1, dump_step, my_rank, rank.logits, cfg.vocab, rank.stream);
+             }
+             return true;
+         };
+@@ -490,6 +536,20 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+         } else if (!run_head()) {
+             return false;
+         }
++        // Combine the bands. Every rank reaches this because `banded` is derived from the
++        // same weight on each of them, so it cannot become a collective only some ranks
++        // enter. The dump below is deliberately after it: banded, a pre-combine dump
++        // would record this rank's slice and two thirds zeros, and the whole point of the
++        // dump is to be comparable against the unbanded run.
++        if (banded &&
++            !coll.allreduce_f32(rank.logits, (std::size_t)cfg.vocab,
++                                (tp::dist::RankStreamHandle)(std::uintptr_t)rank.stream)) {
++            set_err(error, "lm head band allreduce failed");
++            return false;
++        }
++        if (dump_on) {
++            k3_dump_dev("logits", -1, dump_step, my_rank, rank.logits, cfg.vocab, rank.stream);
++        }
+         if (out_logits_host) {
+             // Async D2H on compute stream + one sync (no default-stream barrier).
+             auto run_sync = [&]() {
+@@ -586,8 +646,10 @@ bool ensure_batch(KimiK3DistRank& rank, int n_tok) {
+         return false;
+ 
+     // Rank 0's logits grow to a full [n_tok, vocab] block. The single-token entry
+-    // point writes row 0 of the same allocation, so the two can share it.
+-    if (rank.plan.spec.rank == 0) {
++    // point writes row 0 of the same allocation, so the two can share it. Banded, a
++    // worker projects its slice of all n_tok rows and needs the same block.
++    K3HeadBand hb_alloc;
++    if (rank.plan.spec.rank == 0 || dist_head_band(rank, &hb_alloc)) {
+         if (rank.logits) { cudaFree(rank.logits); rank.logits = nullptr; }
+         if (cudaMalloc(&rank.logits,
+                        (size_t)n_tok * (size_t)cfg.vocab * sizeof(float)) != cudaSuccess)
+@@ -792,7 +854,12 @@ bool kimi_k3_dist_forward_batch(KimiK3DistRank& rank,
+         std::swap(x, xn);
+     }
+ 
+-    if (my_rank == 0) {
++    // Head-band sharding, batched. Same contract as the single-token path (§ the comment
++    // there): each rank projects its own rows of every one of the n_tok logit rows into a
++    // zero-filled [n_tok, vocab] block, and one all-reduce sums the disjoint slices.
++    K3HeadBand hb;
++    const bool banded = dist_head_band(rank, &hb);
++    if (my_rank == 0 || banded) {
+         if (cfg.attn_res_block_size > 0) {
+             if (!w.has_output_res_score || !w.output_res_score.ok()) {
+                 set_err(error, "missing output_res_score");
+@@ -827,17 +894,39 @@ bool kimi_k3_dist_forward_batch(KimiK3DistRank& rank,
+         // the break-even acceptance from 0.093 to ~0.19. The batched kernel declines
+         // (returns false) for anything outside its contract, and the loop below is then
+         // exactly what the single-token path runs.
+-        if (!k3k::k3_proj_f16_tok_f32(rank.logits, cfg.vocab, xn, H, w.output.data,
+-                                      w.output.type, cfg.vocab, H, n_tok,
++        //
++        // Banded, the destination stride stays the full vocab while the row count drops
++        // to the band: the batched kernel already takes those as separate arguments, so a
++        // slice of every row is one call, not a loop.
++        float* const head_dst  = banded ? rank.logits + hb.offset : rank.logits;
++        const void* const head_w = banded
++            ? (const void*)((const char*)w.output.data + hb.byte_off)
++            : w.output.data;
++        const int head_rows = banded ? hb.rows : cfg.vocab;
++        if (banded &&
++            cudaMemsetAsync(rank.logits, 0,
++                            (size_t)n_tok * (size_t)cfg.vocab * sizeof(float),
++                            rank.stream) != cudaSuccess) {
++            set_err(error, "batched logits band zero failed");
++            return false;
++        }
++        if (!k3k::k3_proj_f16_tok_f32(head_dst, cfg.vocab, xn, H, head_w,
++                                      w.output.type, head_rows, H, n_tok,
+                                       rank.stream)) {
+             for (int b = 0; b < n_tok; ++b)
+-                if (!k3k::k3_proj_f32(rank.logits + (size_t)b * cfg.vocab,
+-                                      xn + (size_t)b * H, w.output.data, w.output.type,
+-                                      cfg.vocab, H, rank.stream)) {
++                if (!k3k::k3_proj_f32(head_dst + (size_t)b * cfg.vocab,
++                                      xn + (size_t)b * H, head_w, w.output.type,
++                                      head_rows, H, rank.stream)) {
+                     set_err(error, "lm head proj failed at row " + std::to_string(b));
+                     return false;
+                 }
+         }
++        if (banded &&
++            !coll.allreduce_f32(rank.logits, (std::size_t)n_tok * (std::size_t)cfg.vocab,
++                                (tp::dist::RankStreamHandle)(std::uintptr_t)rank.stream)) {
++            set_err(error, "batched lm head band allreduce failed");
++            return false;
++        }
+ 
+         if (out_logits_host) {
+             if (cudaMemcpyAsync(out_logits_host, rank.logits,
+diff --git a/runtime/src/models/kimi_k3_dist_rank.cpp b/runtime/src/models/kimi_k3_dist_rank.cpp
+index 0298a4d..a3c7d61 100755
+--- a/runtime/src/models/kimi_k3_dist_rank.cpp
++++ b/runtime/src/models/kimi_k3_dist_rank.cpp
+@@ -1,6 +1,7 @@
+ #include "sparkinfer/models/kimi_k3_dist_rank.h"
+ 
+ #include "sparkinfer/gguf.h"
++#include "sparkinfer/models/k3_head_band.h"
+ #include "sparkinfer/models/kimi_k3_gguf_config.h"
+ 
+ #include <cstdio>
+@@ -122,7 +123,13 @@ bool kimi_k3_dist_rank_load(const std::string& gguf_first_shard,
+     out->weights.shard.n_experts_total = out->cfg.n_experts;
+     out->weights.shard.moe_ffn_total = out->cfg.moe_ffn;
+ 
+-    const bool load_head = (spec.rank == 0);
++    // Banded, every rank projects a slice of the head, so every rank must hold it —
++    // output.weight plus output_norm and output_res_score, which live behind the same
++    // flag. The band is a pointer offset into the full tensor rather than a partial
++    // upload: the loader has no row-range path, and at 2.35 GB of F16 against ~10 GB
++    // free per node the replica is affordable where the plumbing for a partial one is
++    // not. This is what makes head banding a forward-pass change and not a loader one.
++    const bool load_head = (spec.rank == 0) || k3_dist_head_band_enabled();
+     const bool load_embed = opt.load_embed_all_ranks || (spec.rank == 0);
+ 
+     // Capability flags are a property of the FILE and must be probed from it.
+-- 
+2.52.0.windows.1
+

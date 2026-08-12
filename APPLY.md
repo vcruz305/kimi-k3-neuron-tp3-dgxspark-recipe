@@ -1,8 +1,7 @@
 # APPLY.md — SparkInfer K3 multi-Spark patch chain
 
 **Base:** `7a9b77a043596157d74e4af376cf9f29f68ce368`  
-**Tip:** `main` — **git am 0001–0020** (0021–0024 do not currently apply; see
-[Series status](#series-status--what-actually-applies) before you plan around them)
+**Tip:** `main` — **git am 0001–0025** (27 patches including 0015/0018a/0019a)
 
 > **If you apply only one patch, make it 0019.** Everything before it runs an
 > engine that silently skips the shared experts, the routed norm and the MLA
@@ -15,7 +14,7 @@
 ```bash
 git clone https://github.com/gittensor-ai-lab/sparkinfer-k3.git && cd sparkinfer-k3
 git checkout -B k3-tp3 7a9b77a043596157d74e4af376cf9f29f68ce368
-git clone --depth 1 --branch sparkinfer-tp3-phase3-loadready-fix \
+git clone --depth 1 --branch main \
   https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe /tmp/k3-recipe
 
 for p in \
@@ -37,14 +36,22 @@ for p in \
   /tmp/k3-recipe/patches/sparkinfer/next/0016-tp-repetition-guard-for-greedy-decode.patch \
   /tmp/k3-recipe/patches/sparkinfer/next/0017-test-fix-three-bugs-in-kimi-k3-state-check.patch \
   /tmp/k3-recipe/patches/sparkinfer/next/0018-tp-attention-shard-kill-switches-for-dist-path.patch \
+  /tmp/k3-recipe/patches/sparkinfer/next/0018a-tp-attention-shard-equivalence-tests.patch \
   /tmp/k3-recipe/patches/sparkinfer/next/0019-tp-probe-gguf-capability-flags-in-dist-rank-load.patch \
   /tmp/k3-recipe/patches/sparkinfer/next/0019a-tp-dist-phase-profiler.patch \
-  /tmp/k3-recipe/patches/sparkinfer/next/0020-tp-per-layer-dump-instrumentation-for-dist-path.patch
+  /tmp/k3-recipe/patches/sparkinfer/next/0020-tp-per-layer-dump-instrumentation-for-dist-path.patch \
+  /tmp/k3-recipe/patches/sparkinfer/next/0021-tp-specdec-stages-0-2-batched-verify.diff \
+  /tmp/k3-recipe/patches/sparkinfer/next/0022-tp-specdec-ar-count-determinism-diagnostic.diff \
+  /tmp/k3-recipe/patches/sparkinfer/next/0023-tp-specdec-stage3-kda-state-rollback.diff \
+  /tmp/k3-recipe/patches/sparkinfer/next/0024-tp-specdec-stage4-ngram-drafter-and-ktoken-protocol.diff \
+  /tmp/k3-recipe/patches/sparkinfer/next/0025-tp-specdec-tuning-confidence-gate-and-dist-head-band.diff
 do git am "$p"; done
 
 cmake -S runtime -B build -DSPARKINFER_TP=ON
 cmake --build build -j"$(nproc)" --target kimi_k3_dist_generate \
-  tp_rank_local_loader_cpu_test tp_dist_generate_protocol_cpu_test
+  tp_rank_local_loader_cpu_test tp_dist_generate_protocol_cpu_test \
+  kimi_k3_tp_kda_check kimi_k3_tp_width_check kimi_k3_kda_batch_check \
+  kimi_k3_spec_draft_check kimi_k3_tune_check
 ```
 
 ## Series status — what actually applies
@@ -53,35 +60,28 @@ A clean-room audit (fresh clone of the pinned base, `git am` in order, nothing
 reused from a working tree) established the following. Run it yourself before
 trusting any of it.
 
-**Verified applying cleanly: 0001–0013, 0015, 0014, 0016–0019, 0019a, 0020 — 21
-patches, all via plain `git am`, no `--ignore-whitespace` needed.** Reproduced
-twice independently: once on Windows/git-bash and once on the Linux fleet from
-fresh clones of both repos. The resulting tree builds: `cmake -S runtime -B build
--DSPARKINFER_TP=ON -DCMAKE_CUDA_ARCHITECTURES=121` then the three documented
-targets, 0 errors, producing `kimi_k3_dist_generate` and
-`libsparkinfer_runtime.so`; `tp_rank_local_loader_cpu_test` passes 38/38 checks
-and `tp_dist_generate_protocol_cpu_test` 17/17.
+**Verified applying cleanly: the complete 27-patch chain through 0025.** A fresh
+checkout of the pinned upstream base accepted every patch via plain `git am`, with
+zero dirty files, and the resulting tree was byte-identical to the tree built on the
+fleet. This closes both earlier gaps:
 
-**Not applying: 0021–0024.** Two independent causes, both still open:
+1. 0015 now includes the two protocol-side allowances for the `-2` distributed
+   KV-reset sentinel. Without them 0024 could not apply and workers would reject a
+   reset as an out-of-vocabulary token.
+2. 0018a installs and registers the KDA/width equivalence harnesses required by the
+   later CMake hunks.
+3. 0021–0025 were rebased onto the real 0014/0016 serve/guard line. The repetition
+   guard remains active on ordinary decode, but speculative verification deliberately
+   bypasses it: 0019 fixed the collapse that the guard originally treated, while
+   applying it during speculation would erase literal repetition, prompt lookup's
+   measured best case.
 
-1. **The specdec line was branched from a different tree.** 0021–0024 were
-   diffed against a tree that has 0015 but *not* 0014 (serve mode) and *not*
-   0016 (repetition guard). Proof: rank0's own `kimi_k3_dist_generate.cpp.bak_specdec`
-   is byte-identical (md5 `2355b484e94a9dcecdf8565445825ada`) to the post-0015
-   file, containing no `--serve` and no repetition guard; and 0021's
-   `kimi_k3_dist_generate.cpp` hunk fails with 0014+0016 applied but succeeds
-   without them. Both lines edit the same file, so they need a real rebase or
-   merge, not a reordering.
-2. **Two test targets are never registered.** `kimi_k3_tp_kda_check` and
-   `kimi_k3_tp_width_check` appear only as unchanged *context* lines in
-   0021/0024/0025's `runtime/CMakeLists.txt` hunks. No patch adds those
-   `add_executable` lines, and no patch copies `patches/sparkinfer/next/new-tests/
-   kimi_k3_tp_{kda,width}_check.cpp` into `runtime/examples/`. So 0021 fails on
-   `CMakeLists.txt` even on the branch where its source hunks do apply.
-
-The speculative-decoding *results* (patches 0021–0024, +34.5% mean) were measured
-on the real fleet and are not in question. What is not yet reproducible from this
-repo alone is the path from the pinned base to that binary.
+The merged fleet build completed with CUDA architecture 121 and passed: loader
+38/38, rank protocol 17/17, drafter/oracle 1089/1089, tuning/head-band 29/29,
+KDA head-shard relL2 9.956e-08, MoE width-shard relL2 1.135e-07, and batched KDA
+bit-identical for K=2..8. An end-to-end `--serve` + protocol-v2 test sent two
+requests (streaming first, distributed KV reset before the second) and shut down
+cleanly. See `evidence/specdec-serve-merge-RECEIPT.md`.
 
 **Root cause of this whole class of defect**: patches were captured as diffs from
 a live working tree that always contained more than the series recorded — the
@@ -103,17 +103,19 @@ against the working tree.
 | **0013** | **pin per-tensor host memory — load time fix (primary path)** |
 | 0014 | rank0 `--serve HOST:PORT` mode — dynamic prompt requests for the API wrapper (see `api-server/`) |
 | **0015** | **rank0 `--prompts-file F` — one CSV token-id line per prompt, run back to back against a single weight load, with a reserved token id `-2` (`kKvResetSentinel`) broadcast between prompts so every rank resets KV + KDA state in lockstep through the existing step barrier (no new frame type, no protocol bump). Per-prompt timing lines are tagged `prompt=N` and a `multi_summary` line reports mean decode tok/s. Single-prompt behavior is byte-for-byte unchanged. Applies between 0013 and 0014 — 0014 was diffed against a tree that already contained this, which is why 0014 carries `kKvResetSentinel` as unchanged *context* and could not apply without it** |
-| 0016 | repetition guard for greedy decode — applies on top of 0014. **Its commit message's root-cause theory is WRONG** (see 0019): it blamed the collapse-to-one-repeated-token failure on IQ1_S quantization + greedy decoding. The real cause was the 0019 capability-flags bug. The guard itself is still worth keeping as a decode-loop safety net, but it was treating a symptom. **Note this patch is one of the two (with 0014) that the 0021–0024 specdec line was never rebased onto** |
+| 0016 | repetition guard for ordinary greedy decode — applies on top of 0014. **Its commit message's root-cause theory is WRONG** (see 0019): it blamed collapse on IQ1_S + greedy decoding; the real cause was the 0019 capability-flags bug. The merged 0024 path keeps this safety net on ordinary decode and deliberately excludes it from speculative verification so literal repetition remains draftable |
 | 0017 | test fix — three bugs in `kimi_k3_state_check` |
 | 0018 | attention shard kill switches (`SPARKINFER_K3_SHARD_KDA` / `_MLA`) for the dist path. **The stored patch was structurally corrupt until repaired** — its second hunk header declared 27 new-side lines over a 26-line body, so git rejected it as `corrupt patch` against *any* tree, not as a context mismatch. The old side (7 lines) matches the real file exactly, so exactly one `+` line was missing; it was restored as the blank line separating the new block from `out->weights.shard = ...`, matching 0019's identical idiom in the same function. That reconstruction is an inference, not a recovered original — it is the only edit in the series not verified against a surviving tree, because **0018 was never applied to the production tree**: rank0's live `kimi_k3_dist_rank.cpp` contains no shard-policy block and still has the `out->weights.policy = opt.policy;` line 0018 deletes. It compiles and links — the repaired hunk is in the built `libsparkinfer_runtime.so`. The corruption shipped in `c0237e2` and had been live in the published recipe ever since; it went unnoticed because nothing re-applied the series from the pinned base until this audit |
 | **0019** | **capability-flag probe in dist rank load — CORRECTNESS FIX, the one that made the engine produce right answers (details below). Does NOT require 0018 — an earlier note here claimed it did, but 0019's hunk is offset against the *pre*-0018 file and the live fleet tree carries 0019 without 0018, so it applies directly on 0017** |
+| **0018a** | **the two attention-shard equivalence harnesses from the 0019 investigation — `kimi_k3_tp_kda_check` (KDA/MLA head sharding) and `kimi_k3_tp_width_check` (MoE FFN width sharding), each asking whether splitting work across ranks and recombining reproduces the unsharded result to float-reassociation tolerance. This is what 0018's `SHARD_KDA`/`_MLA` switches exist to A/B, and what measured relL2 8.2e-09 at the first MLA layer. Their sources sat in `patches/sparkinfer/next/new-tests/` with nothing to install them and no `add_executable` lines anywhere, so they were unbuildable from a clean checkout — and 0021/0024/0025 carry both target names as unchanged *context*, which is why 0021 failed on `CMakeLists.txt`. Both binaries build from the clean-room tree** |
 | **0019a** | **`SPARKINFER_K3_DIST_PROFILE=1` — per-phase CUDA-event timings for the dist decode step (embed / attn / attn_ar / ffn_partial / moe_ar / ffn_finish / head / sync_d2h), each with a percentage and, for the collectives, their element counts. Skips a warmup window then samples a bounded number of steady tokens (`_SKIP`/`_EVERY`/`_MAX`). This is the instrumentation the TP3 decode-time breakdown came from (attention ~36.5%, collectives ~26.2%, MoE ffn_partial ~23.5%). Inert when unset — `timed()` degrades to a plain call with no events and no syncs. Note an ACTIVE profile run serializes each phase, so its absolute tok/s is not a valid benchmark number; read the percentages. Applies between 0019 and 0020 — like 0015, it was used on the fleet but never captured, and 0020 was diffed against a tree that already had it (0020 carries `run_embed` as unchanged *context*)** |
 | 0020 | per-layer dump instrumentation for the dist path (`K3_DUMP_DIR` / `K3_SUBTAP_LAYER`) — debug tooling only, inert unless the env vars are set |
-| 0021–0024 | **DO NOT CURRENTLY APPLY — see [Series status](#series-status--what-actually-applies). They are listed below for what they contain and what was measured, not as a working apply path.** |
+| 0021–0025 | **Rebased onto 0014/0016, verified via clean `git am`, fleet build, equivalence tests, five-run benchmark, and serve-mode integration test** |
 | 0021 | speculative decoding Stages 0-2 — fixes a crashing batched-KDA flag (unlocks 52% of dense bytes for any batched path), consolidates KDA state into contiguous arenas, adds a batched F16 LM head, and a new `kimi_k3_dist_forward_batch()` entry point. No user-facing effect on its own (details below) |
 | 0022 | NCCL all-reduce count-determinism diagnostic + the clean marginal-cost measurement protocol used to validate 0021-2's economics. Inert unless `SPARKINFER_K3_AR_PAD` is set. Requires 0021 |
 | 0023 | Stage 3 — KDA recurrent-state rollback (a history ring on 0021's arenas), so a rejected speculative draft can be cleanly unwound. Requires 0021 (shares `kimi_k3_dist_forward.cpp`/`kimi_k3.cpp` hunks) |
 | **0024** | **speculative decoding Stage 4 — the actual n-gram drafter, accept/reject loop, and rank-protocol v2 (carries a whole verify batch + deferred rollback per step). USER-FACING: `--spec-draft K`. Requires 0021+0023 (shares `kimi_k3_dist_forward.cpp`, `kimi_k3_dist_generate.cpp`, `rank_protocol.h`)** |
+| **0025** | **match-confidence gating plus distributed LM-head banding. `--spec-min-occur 2 --spec-require-agree` filters false-positive n-grams; `SPARKINFER_K3_DIST_HEAD_BAND=1` gives each rank an uneven vocab band (54614/54613/54613 for TP3), zero-fills the rest, then reuses all-reduce. 129/129 dumped logits were bitwise identical to the unbanded path. Combined measured 8.5447 tok/s, +40.61% over the average of bracketing baselines** |
 
 ### 0011
 - `finish()` no longer holds `mu_` while waiting (unblocks rx FinishAcks)
@@ -167,7 +169,7 @@ against the working tree.
   under IQ1_S quantization noise — unconfirmed. Output is coherent and
   first-token-exact; it is **not** verified byte-identical beyond that.
 
-### 0021-0024 — speculative decoding (n-gram / prompt-lookup)
+### 0021-0025 — speculative decoding, confidence gating, and head banding
 
 - **What it is**: rank0 drafts tokens by matching the current sequence against its own
   generation history (no second model), verifies the whole draft in one batched forward
@@ -186,8 +188,10 @@ against the working tree.
   snapshot consistency), never a hypothetical bit-identical sequential run — which is
   good, because that would be uncomputable without redoing the sequential pass anyway.
   0024 = the actual drafter and the rank-protocol change to carry it.
-- **Measured on real TP3 hardware** (64-token generations, 3 workload types, best config
-  `--spec-draft 4 --spec-ngram-min 2`):
+- **Measured on real TP3 hardware** (64-token generations, 3 workload types). The
+  original Stage 4 result used `--spec-draft 4 --spec-ngram-min 2`; the current
+  candidate adds `--spec-ngram-max 3 --spec-min-occur 2 --spec-require-agree` and
+  `SPARKINFER_K3_DIST_HEAD_BAND=1`:
 
   | workload | baseline tok/s | with speculative decoding | delta |
   |---|---:|---:|---:|
@@ -199,6 +203,19 @@ against the working tree.
   `K=8` measured *worse* than `K=4` — per-position acceptance collapses past match-depth
   3 regardless of batch size, so a bigger speculative batch just costs more with nothing
   left to fill it. Do not assume larger K is better.
+
+  Current merged-tree five-run sequence, with baselines bracketing the candidates:
+
+  | config | code | repetition | prose | mean | vs avg baseline |
+  |---|---:|---:|---:|---:|---:|
+  | baseline before | 6.1612 | 5.7251 | 6.1622 | 6.0162 | — |
+  | confidence-gated K=4 | — | — | — | 8.0591 | +32.61% |
+  | head-band only | 6.4718 | 6.3173 | 6.3888 | 6.3926 | +5.19% |
+  | **confidence K=4 + head-band** | **8.1651** | **10.9018** | **6.5672** | **8.5447** | **+40.61%** |
+  | baseline after | 6.1477 | 6.1166 | 6.1496 | 6.1379 | — |
+
+  Average bracketing baseline: 6.07705 tok/s. Draft acceptance in both gated
+  configurations was 59/64 = 0.9219; the serve/guard merge did not change it.
 - **Correctness**: verified as "always a valid greedy decoding trajectory," not
   byte-identical to non-speculative decoding (see the NCCL finding above — closing that
   gap needs a count-*and*-offset-invariant collective, not yet built, tracked as a
@@ -218,13 +235,8 @@ against the working tree.
   IQ1_S-compressed target, and there's no spare memory on a Spark for a second model's
   weights anyway) and TP4. Full design rationale, break-even math, and the staged
   verification process: [`docs/SPECULATIVE-DECODING-DESIGN.md`](docs/SPECULATIVE-DECODING-DESIGN.md).
-- **CRLF note**: `runtime/src/models/kimi_k3_dist_forward.cpp` has pre-existing CRLF line
-  endings inconsistent with the rest of the LF tree (contamination from an earlier
-  Windows-side editor round-trip, not this series' doing). Patches 0021 and 0023 touch
-  that file and carry the mixed endings through. `git apply` may warn or refuse on
-  strict whitespace checking — use `git apply --ignore-whitespace`, which applies these
-  cleanly (verified: reproduces the exact tree that was built, deployed, and tested on
-  the live fleet).
+- **Apply note**: the rebased 0021–0025 patches are ordinary mail patches. Apply them
+  with `git am` exactly as shown above; no whitespace override is required.
 
 ## TPS measurement run
 
@@ -250,9 +262,6 @@ boundary — a pre-0019 engine is faster only because it is skipping work.
 Confirm from the run's own logs: rank0 stderr must show
 `[k3-dist] caps probe(blk.3): q_lora=1 attn_gate=1 shexp=1 routed_norm=1`.
 
-No reproducibility claim beyond what the clean-room audit actually covers: the
-chain is verified to apply and build through **0020**, and the speculative-decoding
-patches 0021–0024 are **not** reproducible from this repo today (see
-[Series status](#series-status--what-actually-applies)). Their measured results
-stand on the fleet runs; the apply path does not. Do not describe the series as
-"0001–0024 applies" until that is fixed and re-verified from a fresh clone.
+The clean-room audit covers the complete chain through **0025**: 27 plain `git am`
+applications from the pinned base, zero dirty files, and a tree byte-identical to
+the fleet build. Do not extend that claim to later unverified working-tree changes.

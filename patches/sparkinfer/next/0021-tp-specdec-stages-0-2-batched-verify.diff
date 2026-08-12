@@ -1,6 +1,1031 @@
+From ba4cb5b830389016f982ebbafec52e430d01088a Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 22:37:34 -0700
+Subject: [PATCH] tp: 0021 speculative batched-verify infrastructure
+
+---
+ kernels/csrc/cuda/kimi_k3/k3_kernels.cu       | 136 +++++++
+ kernels/include/sparkinfer/kernels/kimi_k3.h  |  21 +
+ runtime/CMakeLists.txt                        |   4 +
+ runtime/examples/kimi_k3_dist_generate.cpp    | 224 ++++++++++-
+ runtime/examples/kimi_k3_kda_batch_check.cpp  | 376 ++++++++++++++++++
+ runtime/include/sparkinfer/models/kimi_k3.h   |  43 +-
+ .../sparkinfer/models/kimi_k3_dist_forward.h  |  30 ++
+ .../sparkinfer/models/kimi_k3_dist_rank.h     |  20 +-
+ runtime/src/models/kimi_k3.cpp                | 127 ++++--
+ runtime/src/models/kimi_k3_dist_forward.cpp   | 287 +++++++++++++
+ 10 files changed, 1200 insertions(+), 68 deletions(-)
+ create mode 100644 runtime/examples/kimi_k3_kda_batch_check.cpp
+
+diff --git a/kernels/csrc/cuda/kimi_k3/k3_kernels.cu b/kernels/csrc/cuda/kimi_k3/k3_kernels.cu
+index e8addf3..76ffc13 100644
+--- a/kernels/csrc/cuda/kimi_k3/k3_kernels.cu
++++ b/kernels/csrc/cuda/kimi_k3/k3_kernels.cu
+@@ -4135,6 +4135,84 @@ __global__ void proj_f16_kernel(float* __restrict__ y, const float* __restrict__
+     if (threadIdx.x == 0) y[n] = acc;
+ }
+ 
++// TOKEN-BATCHED F16 PROJECTION — proj_f16_kernel with a token axis inside the block.
++//
++// WHY IT HAS TO EXIST. The LM head is the one F16 weight in the model and it is
++// 163840 x 7168 = 2.349 GB. A K-token verify pass that looped proj_f16_kernel would
++// re-stream all 2.349 GB per position; at the measured 146.8 GB/s that is ~16 ms of
++// pure weight traffic per extra token, which on its own roughly DOUBLES the marginal
++// cost of a speculative position and moves the break-even acceptance from 0.093 to
++// ~0.19. Every other big projection in the model already has a token-batched form
++// (k3_proj_q8act_tok_f32); that one is Q8_0-only and the head is not Q8_0.
++//
++// The row of W is loaded ONCE per k-chunk and spent on TOKS activations, so the
++// weight term divides by TOKS. What repeats instead is the activation, 28 KB against
++// 2.349 GB.
++//
++// BIT-IDENTICAL PER OUTPUT ELEMENT, and here is the whole argument. Fix an output
++// (t, n) and compare with proj_f16_kernel run on token t alone:
++//   * k-walk. Both start at k = threadIdx.x and stride the SAME way — the 8-way
++//     unrolled `k += 8*BLOCK` main loop with the same `k + 7*BLOCK < K` bound, then
++//     the same `k += BLOCK` tail. Thread i owns exactly the same k values in the same
++//     ascending order.
++//   * accumulation. Both do `acc += w[u] * v[u]` for u = 0..7 in ascending u, with w
++//     the same __half2float(row[...]) and v the same x[...]. Same expression, same
++//     associativity, same order.
++//   * reduction tree. Both call block_sum<BLOCK> over the same BLOCK threads, which
++//     does the same shfl_down butterfly and the same ascending fold over warps.
++// TOKS changes only which output elements share a CUDA block, and it appears in no
++// accumulation order. That is the same argument proj_q8_0_q8_0_tok_kernel already
++// leans on for the Q8_0 side.
++//
++// block_sum contains __syncthreads(), so EVERY thread calls it for EVERY t and only
++// the store is guarded — the same rule the multirow kernel above is written to. The
++// bounds check on the accumulate loops is a separate matter: those contain no
++// barrier, so skipping an out-of-range token there is ordinary divergence.
++template <int BLOCK, int TOKS>
++__global__ void proj_f16_tok_kernel(float* __restrict__ y, int ldy,
++                                    const float* __restrict__ x, int64_t x_stride,
++                                    const __half* __restrict__ W, int K, int n_tok) {
++    k3_pdl_sync();
++    const int n  = blockIdx.x;
++    const int t0 = blockIdx.y * TOKS;
++    const __half* row = W + (size_t)n * K;
++    __shared__ float shm[BLOCK / 32 + 1];
++    float acc[TOKS];
++#pragma unroll
++    for (int t = 0; t < TOKS; ++t) acc[t] = 0.0f;
++
++    int k = threadIdx.x;
++    for (; k + 7 * BLOCK < K; k += 8 * BLOCK) {
++        float w[8];
++#pragma unroll
++        for (int u = 0; u < 8; ++u) w[u] = __half2float(row[k + u * BLOCK]);
++#pragma unroll
++        for (int t = 0; t < TOKS; ++t) {
++            if (t0 + t >= n_tok) continue;
++            const float* xt = x + (int64_t)(t0 + t) * x_stride;
++            float v[8];
++#pragma unroll
++            for (int u = 0; u < 8; ++u) v[u] = xt[k + u * BLOCK];
++#pragma unroll
++            for (int u = 0; u < 8; ++u) acc[t] += w[u] * v[u];
++        }
++    }
++    for (; k < K; k += BLOCK) {
++        const float wv = __half2float(row[k]);
++#pragma unroll
++        for (int t = 0; t < TOKS; ++t) {
++            if (t0 + t >= n_tok) continue;
++            acc[t] += wv * x[(int64_t)(t0 + t) * x_stride + k];
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < TOKS; ++t) {
++        const float s = block_sum<BLOCK>(acc[t], shm);
++        if (threadIdx.x == 0 && t0 + t < n_tok)
++            y[(size_t)(t0 + t) * (size_t)ldy + n] = s;
++    }
++}
++
+ 
+ // ROW AXIS (blockIdx.y). ALL THREE operands are row-major activations and all three are
+ // offset — this entry point is the residual combine, not a broadcast bias add. A caller
+@@ -6365,6 +6443,64 @@ bool k3_proj_q8act_tok_f32(float* y, int ldy, const void* q8_act, int ld_act_blo
+     return true;
+ }
+ 
++// Token-batched F16 projection: [n_tok, K] activation -> [n_tok, N] logits, one pass
++// over the weight. The LM head's batched form; see proj_f16_tok_kernel for the
++// bit-identity argument.
++//
++// RETURNS FALSE MEANING "USE THE PER-TOKEN PATH", NEVER "ERROR" — the same contract
++// every other batched helper in this file keeps. n_tok == 1 declines on its first
++// line, so a caller that always routes through here gets the exact single-token
++// launch k3_proj_f32 makes today.
++bool k3_proj_f16_tok_f32(float* y, int ldy, const float* x, int64_t x_stride,
++                         const void* W, int wtype, int N, int K, int n_tok,
++                         cudaStream_t stream) {
++    if (N <= 0 || K <= 0 || n_tok <= 1) return false;
++    if (wtype != 1 || !W || !y || !x) return false;
++    if (ldy < N) return false;
++    if (x_stride < (int64_t)K) return false;
++
++    // BLOCK follows k3_proj_f32's F16 arm exactly, so the per-thread k-walk that the
++    // bit-identity argument rests on is the same walk. The head is N = 163840, which
++    // takes the `N > 64` branch to 128 either way; the other tiers are kept so a
++    // narrow banded head lands where the single-token path would.
++    const int blk = (N > 64 || K < 1024) ? 128 : (K >= 4096 ? 1024 : 512);
++
++    // TOKS is what divides the weight traffic. 8 is as far as the accumulator array
++    // goes before register pressure costs more occupancy than the extra reuse buys,
++    // and the grid stays wide regardless because N is enormous for the head.
++    static const int env_toks = [] {
++        const char* e = std::getenv("SPARKINFER_K3_HEAD_TOKS");
++        const int v = e ? std::atoi(e) : 8;
++        return (v == 0 || v == 2 || v == 4 || v == 8) ? v : 8;
++    }();
++    if (env_toks == 0) return false;
++    const int TOKS = n_tok < env_toks ? (n_tok >= 4 ? 4 : 2) : env_toks;
++    const int tok_blocks = (n_tok + TOKS - 1) / TOKS;
++
++#define K3_HEADTOK_LAUNCH(BLK, T)                                                    \
++    do {                                                                             \
++        const dim3 grid((unsigned)N, (unsigned)tok_blocks);                          \
++        k3_pdl_launch(grid, (BLK), 0, stream, proj_f16_tok_kernel<(BLK), (T)>,       \
++                      y, ldy, x, x_stride, (const __half*)W, K, n_tok);              \
++    } while (0)
++#define K3_HEADTOK_TOKS(BLK)                                                         \
++    do {                                                                             \
++        switch (TOKS) {                                                              \
++            case 8:  K3_HEADTOK_LAUNCH(BLK, 8); break;                               \
++            case 4:  K3_HEADTOK_LAUNCH(BLK, 4); break;                               \
++            default: K3_HEADTOK_LAUNCH(BLK, 2); break;                               \
++        }                                                                            \
++    } while (0)
++    switch (blk) {
++        case 1024: K3_HEADTOK_TOKS(1024); break;
++        case 512:  K3_HEADTOK_TOKS(512);  break;
++        default:   K3_HEADTOK_TOKS(128);  break;
++    }
++#undef K3_HEADTOK_TOKS
++#undef K3_HEADTOK_LAUNCH
++    return true;
++}
++
+ // Quantise n_tok CONTIGUOUS [K] activations in one launch.
+ //
+ // VERIFIED against both shapes in k3_proj_q8_fast.cu. quantize_q8_0_warp_kernel derives
+diff --git a/kernels/include/sparkinfer/kernels/kimi_k3.h b/kernels/include/sparkinfer/kernels/kimi_k3.h
+index 53778c8..942dcf4 100644
+--- a/kernels/include/sparkinfer/kernels/kimi_k3.h
++++ b/kernels/include/sparkinfer/kernels/kimi_k3.h
+@@ -1064,6 +1064,27 @@ bool k3_proj_q8act_tok_f32(float* y, int ldy, const void* q8_act, int ld_act_blo
+                            const void* W, int wtype, int N, int K, int n_tok,
+                            cudaStream_t stream);
+ 
++// TOKEN-BATCHED F16 PROJECTION — the LM head's batched form, and the only reason it
++// is separate from the Q8_0 one above is that the head is the model's single F16
++// weight and that helper is Q8_0-only.
++//
++// [n_tok, K] activation (rows x_stride apart) -> [n_tok, N] output (rows ldy apart),
++// reading the 2.349 GB head ONCE for the whole batch instead of once per position.
++// Looping the single-token k3_proj_f32 instead costs ~16 ms per extra position at the
++// measured 146.8 GB/s, which roughly doubles the marginal cost of a speculative token.
++//
++// BIT-IDENTICAL per output element to n_tok separate k3_proj_f32 calls: same k-walk
++// (the same 8-way unrolled `k += 8*BLOCK` main loop and `k += BLOCK` tail from the
++// same starting threadIdx.x), same `acc += w[u]*v[u]` order, same block_sum tree.
++// n_tok only decides which outputs share a CUDA block.
++//
++// SPARKINFER_K3_HEAD_TOKS sets the token tile (2/4/8, default 8); =0 declines so the
++// caller falls back to the per-token loop on the same binary. Returns false meaning
++// "use the per-token path" for n_tok == 1, a non-F16 weight, or under-sized strides.
++bool k3_proj_f16_tok_f32(float* y, int ldy, const float* x, int64_t x_stride,
++                         const void* W, int wtype, int N, int K, int n_tok,
++                         cudaStream_t stream);
++
+ bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
+                       int N, int K, void* q8_scratch, cudaStream_t stream);
+ 
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 83c1e44..29e751f 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -181,6 +181,10 @@ add_executable(kimi_k3_tp_check examples/kimi_k3_tp_check.cpp)
+     target_link_libraries(kimi_k3_tp_kda_check PRIVATE sparkinfer_runtime CUDA::cudart)
+     set_target_properties(kimi_k3_tp_kda_check PROPERTIES CXX_STANDARD 17)
+ 
++    add_executable(kimi_k3_kda_batch_check examples/kimi_k3_kda_batch_check.cpp)
++    target_link_libraries(kimi_k3_kda_batch_check PRIVATE sparkinfer_runtime CUDA::cudart)
++    set_target_properties(kimi_k3_kda_batch_check PROPERTIES CXX_STANDARD 17)
++
+     add_executable(kimi_k3_tp_width_check examples/kimi_k3_tp_width_check.cpp)
+     target_link_libraries(kimi_k3_tp_width_check PRIVATE sparkinfer_runtime CUDA::cudart)
+     set_target_properties(kimi_k3_tp_width_check PROPERTIES CXX_STANDARD 17)
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+index c78d96e..fa44f9b 100644
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -21,6 +21,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -354,11 +355,166 @@ void apply_decode_guard(float* logits, int vocab, const std::vector<int>& genera
+ 
+ }  // namespace
+ 
++// ---------------------------------------------------------------------------
++// --spec-bench: batched-verify correctness + marginal-cost measurement
++// ---------------------------------------------------------------------------
++//
++// Runs IDENTICALLY ON EVERY RANK and sends no control messages. That is deliberate:
++// the rank protocol carries one token id per step, and widening it is Stage 4's work
++// (it belongs with the drafter that needs it). Here every rank derives the same verify
++// tokens from the same --prompt-ids it was already given, so the ranks stay in lockstep
++// through the NCCL collectives without a protocol change — which keeps this measurement
++// from depending on a message format nobody has reviewed yet.
++//
++// Two things are measured, and they answer different questions:
++//   1. Does forward_batch(K) agree with K sequential forward_token calls? Reported as
++//      cosine, top-1 agreement and exact-equality — NOT as a pass/fail. The engine has
++//      a known numerical-fidelity gap at longer context (near-tied MoE routing under
++//      IQ1_S), so "batched verify disagrees with sequential decode" is a plausible real
++//      outcome, and a bare assert would hide the size of it.
++//   2. What does an extra verified position cost? step(K) for K = 1..Kmax, from which
++//      the marginal cost m is fitted. Everything downstream of this stage depends on
++//      that number.
++static int run_spec_bench(sparkinfer::KimiK3DistRank& dist,
++                          sparkinfer::tp::dist::RankCollective& coll,
++                          const std::vector<int>& prompt, int Kmax) {
++    using clock = std::chrono::steady_clock;
++    const int rank_id = dist.plan.spec.rank;
++    const int vocab = dist.cfg.vocab;
++    const bool r0 = (rank_id == 0);
++    std::string err;
++
++    // The verify tokens are the prompt cycled: deterministic on every rank without a
++    // message, and in-distribution, so MoE routing (and therefore the expert traffic
++    // that dominates the marginal cost) stays representative.
++    auto vtok = [&](int i) { return prompt[(size_t)(i % (int)prompt.size())]; };
++
++    auto replay = [&]() -> bool {
++        sparkinfer::kimi_k3_reset_state(dist.state);
++        if (cudaStreamSynchronize(dist.stream) != cudaSuccess) return false;
++        for (size_t i = 0; i < prompt.size(); ++i)
++            if (!sparkinfer::kimi_k3_dist_forward_token(dist, coll, prompt[i], nullptr,
++                                                        &err))
++                return false;
++        return true;
++    };
++
++    if (r0) {
++        std::printf("\n[spec-bench] prompt=%zu tokens, Kmax=%d, vocab=%d\n",
++                    prompt.size(), Kmax, vocab);
++        std::printf("[spec-bench] --- correctness: forward_batch(K) vs K x forward_token ---\n");
++        std::fflush(stdout);
++    }
++
++    for (int K = 2; K <= Kmax; ++K) {
++        std::vector<float> seq(r0 ? (size_t)K * vocab : 0);
++        std::vector<float> bat(r0 ? (size_t)K * vocab : 0);
++        std::vector<int> ids((size_t)K);
++        for (int b = 0; b < K; ++b) ids[(size_t)b] = vtok(b);
++
++        if (!replay()) { std::fprintf(stderr, "replay failed: %s\n", err.c_str()); return 1; }
++        for (int b = 0; b < K; ++b)
++            if (!sparkinfer::kimi_k3_dist_forward_token(
++                    dist, coll, ids[(size_t)b],
++                    r0 ? seq.data() + (size_t)b * vocab : nullptr, &err)) {
++                std::fprintf(stderr, "seq forward failed: %s\n", err.c_str());
++                return 1;
++            }
++
++        if (!replay()) { std::fprintf(stderr, "replay failed: %s\n", err.c_str()); return 1; }
++        if (!sparkinfer::kimi_k3_dist_forward_batch(dist, coll, ids.data(), K,
++                                                    r0 ? bat.data() : nullptr, &err)) {
++            std::fprintf(stderr, "batch forward failed: %s\n", err.c_str());
++            return 1;
++        }
++
++        if (!r0) continue;
++        for (int b = 0; b < K; ++b) {
++            const float* a = seq.data() + (size_t)b * vocab;
++            const float* c = bat.data() + (size_t)b * vocab;
++            double dot = 0, na = 0, nc = 0, maxabs = 0;
++            size_t n_exact = 0;
++            int ta = 0, tc = 0;
++            for (int i = 0; i < vocab; ++i) {
++                dot += (double)a[i] * (double)c[i];
++                na += (double)a[i] * (double)a[i];
++                nc += (double)c[i] * (double)c[i];
++                const double d = std::fabs((double)a[i] - (double)c[i]);
++                if (d > maxabs) maxabs = d;
++                if (std::memcmp(&a[i], &c[i], sizeof(float)) == 0) ++n_exact;
++                if (a[i] > a[ta]) ta = i;
++                if (c[i] > c[tc]) tc = i;
++            }
++            const double cos = dot / (std::sqrt(na) * std::sqrt(nc) + 1e-30);
++            std::printf("[spec-bench] K=%d pos=%d cos=%.9f top1 seq=%d bat=%d %s "
++                        "max|d|=%.3e exact=%.4f%%\n",
++                        K, b, cos, ta, tc, ta == tc ? "AGREE" : "**DISAGREE**", maxabs,
++                        100.0 * (double)n_exact / (double)vocab);
++        }
++        std::fflush(stdout);
++    }
++
++    if (r0) {
++        std::printf("[spec-bench] --- timing: step(K) ---\n");
++        std::fflush(stdout);
++    }
++    // Steady-state only: the first pass after a reset pays cold caches and, on rank 0,
++    // the one-off logits reallocation. Every rank runs the same counts so the
++    // collectives stay matched.
++    const int warm = 2, reps = 5;
++    std::vector<double> ms_of_K((size_t)Kmax + 1, 0.0);
++    for (int K = 1; K <= Kmax; ++K) {
++        if (!replay()) { std::fprintf(stderr, "replay failed: %s\n", err.c_str()); return 1; }
++        std::vector<int> ids((size_t)K);
++        double best_sum = 0;
++        for (int r = 0; r < warm + reps; ++r) {
++            for (int b = 0; b < K; ++b) ids[(size_t)b] = vtok(r * K + b);
++            const auto t0 = clock::now();
++            if (!sparkinfer::kimi_k3_dist_forward_batch(dist, coll, ids.data(), K,
++                                                        nullptr, &err)) {
++                std::fprintf(stderr, "timed batch failed: %s\n", err.c_str());
++                return 1;
++            }
++            if (cudaStreamSynchronize(dist.stream) != cudaSuccess) return 1;
++            const double ms =
++                std::chrono::duration<double, std::milli>(clock::now() - t0).count();
++            if (r >= warm) best_sum += ms;
++        }
++        ms_of_K[(size_t)K] = best_sum / reps;
++        if (r0) {
++            std::printf("[spec-bench] step(K=%d) = %.3f ms   (%.3f ms/token)\n", K,
++                        ms_of_K[(size_t)K], ms_of_K[(size_t)K] / K);
++            std::fflush(stdout);
++        }
++    }
++
++    if (r0 && Kmax >= 2) {
++        // Least-squares fit of step(K) = T + m*K over K = 1..Kmax. T is the fixed cost
++        // of a pass and m is what one extra verified position costs -- the number the
++        // whole speculative-decoding case rests on, and the one thing in the design
++        // that was modelled rather than measured.
++        double sx = 0, sy = 0, sxx = 0, sxy = 0;
++        const int n = Kmax;
++        for (int K = 1; K <= Kmax; ++K) {
++            sx += K; sy += ms_of_K[(size_t)K];
++            sxx += (double)K * K; sxy += (double)K * ms_of_K[(size_t)K];
++        }
++        const double m = (n * sxy - sx * sy) / (n * sxx - sx * sx);
++        const double T = (sy - m * sx) / n;
++        std::printf("\n[spec-bench] FIT step(K) = %.2f + %.2f*K ms\n", T, m);
++        std::printf("[spec-bench] marginal cost m = %.2f ms; break-even acceptance "
++                    "m/step(1) = %.4f\n", m, m / ms_of_K[1]);
++        std::fflush(stdout);
++    }
++    return 0;
++}
++
+ int main(int argc, char** argv) {
+     int rank = -1, world = 3, device = 0, n_predict = 8, max_ctx = 8192;
+     std::uint64_t session_id = 1;
+     std::string model, listen, coord, prompt_csv, prompt_file, prompts_file, serve_addr;
+     bool dry_protocol = false;
++    int spec_bench = 0;   // --spec-bench K: batched-verify correctness + step(K) timing
+ 
+     for (int i = 1; i < argc; ++i) {
+         auto need = [&](const char* flag) -> const char* {
+@@ -385,6 +541,7 @@ int main(int argc, char** argv) {
+         else if (!std::strcmp(argv[i], "--session-id"))
+             session_id = (std::uint64_t)std::strtoull(need("--session-id"), nullptr, 10);
+         else if (!std::strcmp(argv[i], "--dry-protocol")) dry_protocol = true;
++        else if (!std::strcmp(argv[i], "--spec-bench")) spec_bench = std::atoi(need("--spec-bench"));
+         else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
+             usage(argv[0]);
+             return 0;
+@@ -535,6 +692,35 @@ int main(int argc, char** argv) {
+         }
+         gen_trace("rank0 bootstrap+load complete; starting prompt loop");
+ 
++        // Build prompt list: multi-prompt file OR single prompt.
++        std::vector<std::vector<int>> prompts;
++        if (!prompts_file.empty()) {
++            prompts = load_prompts_file(prompts_file);
++        } else {
++            std::vector<int> prompt;
++            if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
++            else if (!prompt_csv.empty()) prompt = parse_ids_csv(prompt_csv);
++            else prompt = {1};
++            if (!prompt.empty()) prompts.push_back(std::move(prompt));
++        }
++        if (prompts.empty()) {
++            std::fprintf(stderr, "empty prompt ids\n");
++            return 2;
++        }
++        std::printf("[rank0] prompts=%zu n_predict=%d max_ctx=%d (multi-prompt keeps weights loaded)\n",
++                    prompts.size(), n_predict, max_ctx);
++        std::fflush(stdout);
++
++        // The bench drives every rank through the same call sequence with no control
++        // messages, so it runs INSTEAD OF the generate loop rather than beside it. The
++        // workers key off the same flag and enter it instead of wait_token.
++        if (spec_bench > 0) {
++            const int rc = run_spec_bench(dist, *coll, prompts[0], spec_bench);
++            ctr.finish(nullptr);
++            kimi_k3_dist_rank_free(&dist);
++            return rc;
++        }
++
+         std::vector<float> logits((size_t)dist.cfg.vocab);
+ 
+         auto one_step = [&](int tok, float* logits_out) -> bool {
+@@ -706,25 +892,6 @@ int main(int argc, char** argv) {
+             return 0;
+         }
+ 
+-        // Build prompt list: multi-prompt file OR single prompt.
+-        std::vector<std::vector<int>> prompts;
+-        if (!prompts_file.empty()) {
+-            prompts = load_prompts_file(prompts_file);
+-        } else {
+-            std::vector<int> prompt;
+-            if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
+-            else if (!prompt_csv.empty()) prompt = parse_ids_csv(prompt_csv);
+-            else prompt = {1};
+-            if (!prompt.empty()) prompts.push_back(std::move(prompt));
+-        }
+-        if (prompts.empty()) {
+-            std::fprintf(stderr, "empty prompt ids\n");
+-            return 2;
+-        }
+-        std::printf("[rank0] prompts=%zu n_predict=%d max_ctx=%d (multi-prompt keeps weights loaded)\n",
+-                    prompts.size(), n_predict, max_ctx);
+-        std::fflush(stdout);
+-
+         using clock = std::chrono::steady_clock;
+         double sum_decode_tps = 0.0;
+         int n_ok = 0;
+@@ -846,6 +1013,25 @@ int main(int argc, char** argv) {
+         gen_trace(buf);
+     }
+ 
++    // Workers enter the bench INSTEAD OF wait_token: it exchanges no control messages,
++    // so a worker sitting in wait_token would never reach the collectives rank 0 is
++    // about to enter and every rank would hang in NCCL. Both sides key off the same
++    // flag, and the launcher must pass the same --prompt-ids to every rank because the
++    // verify tokens are derived from it locally.
++    if (spec_bench > 0) {
++        std::vector<int> bench_prompt = prompt_csv.empty()
++            ? (prompt_file.empty() ? std::vector<int>() : load_ids_file(prompt_file))
++            : parse_ids_csv(prompt_csv);
++        if (bench_prompt.empty()) {
++            std::fprintf(stderr,
++                         "--spec-bench needs the SAME --prompt-ids on every rank\n");
++            return 2;
++        }
++        const int rc = run_spec_bench(dist, *coll, bench_prompt, spec_bench);
++        kimi_k3_dist_rank_free(&dist);
++        return rc;
++    }
++
+     for (;;) {
+         int tok = -1;
+         {
+diff --git a/runtime/examples/kimi_k3_kda_batch_check.cpp b/runtime/examples/kimi_k3_kda_batch_check.cpp
+new file mode 100644
+index 0000000..61f0b09
+--- /dev/null
++++ b/runtime/examples/kimi_k3_kda_batch_check.cpp
+@@ -0,0 +1,376 @@
++// KDA batched Attn equivalence: kimi_k3_forward_layer_phase(Attn, n_tok=K) on a KDA
++// layer must be BIT-IDENTICAL to K sequential n_tok=1 calls over the same K rows.
++//
++//   kimi_k3_kda_batch_check <first-shard.gguf> [Kmax] [layer]
++//
++// WHY THIS EXISTS. SPARKINFER_K3_KDA_QKVG_BATCH is the gate that lets a KDA layer take
++// n_tok > 1 for its PROJECTION half (q/k/v/g and attn_output; the conv + delta-rule scan
++// stays a per-token loop by construction). It ships OFF because turning it on faulted --
++//   [k3] LAUNCH FAILED at layer 0, phase Attn: invalid argument
++// -- for every chunk >= 2 tokens, and nothing in the tree reproduced that at a size a
++// person could iterate on. This does: ONE layer, one GPU, seconds per run.
++//
++// It is also the equivalence proof the gate needs before it can default on. 69 of 93
++// layers are KDA and their attention projections are 52.1% of the dense bytes a decode
++// token streams, so this path is the difference between a batched verify amortising most
++// of the model and half of it.
++//
++// THE COMPARISON IS BITWISE, NOT APPROXIMATE, AND THAT IS THE POINT. The batched arm is
++// supposed to change WHEN the projections are issued, never what they compute: same
++// weights, same activation bytes, same accumulation order per output element. Any
++// tolerance at all would let a real reordering through, and this engine has already
++// shipped one silent-wrong-answer bug that every approximate check passed.
++//
++// Both arms drive the SAME recurrent state forward across the K rows -- reset once, then
++// tokens 0..K-1 in order -- so this tests the scan's carry as well as the projections.
++//
++// THE `full` MODE IS THE ONE THAT MATTERS FOR THE GATE, and the reason is in the
++// CHANGELOG. #148 shipped TWO defects together: this gate being read opt-out, and a
++// residual-bank stride swap in which `(n_rows, act_row_stride, bank_row_stride)` was
++// called as `(n_rows, bank_row, H)`. The second is invisible until the model is deep
++// enough to bank TWICE -- max_ckpt is ceil(n_layers/12), so at <= 12 layers the two
++// strides are equal and each wrong argument lands on the right value. It was bisected
++// as "bit-identical through 12 layers, KLD 1.64 at 14".
++//
++// Both were fixed in #148. Only the second was fixed by CORRECTING it; the first was
++// "fixed" by disabling the feature, and its comment says so ("left opt-in until the
++// fault is understood"). So the `LAUNCH FAILED` narrative in that comment describes a
++// tree that no longer exists, and nothing re-tested the gate afterwards.
++//
++// `full` runs >= 13 layers through phase All so the bank is written twice. That is the
++// exact condition the stride bug needed, and it is the arm that can tell "the fault was
++// collateral damage from the other defect" from "the fault is still there".
++
++#include "sparkinfer/gguf.h"
++#include "sparkinfer/kernels/kimi_k3.h"
++#include "sparkinfer/models/kimi_k3.h"
++#include "sparkinfer/models/kimi_k3_config.h"
++#include "sparkinfer/models/kimi_k3_gguf_manifest.h"
++
++#include <cuda_runtime.h>
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++using namespace sparkinfer;
++namespace k3k = sparkinfer::kernels::k3;
++
++namespace {
++
++struct Ctx {
++    KimiK3Weights      w;
++    KimiK3RuntimeState st;
++    KimiK3Forward      fwd;
++    // What alloc_state handed out, so the per-token repointing below can be undone
++    // before free. state.d_pos and state.res_bank are OWNED by kimi_k3_alloc_state and
++    // freed through it; leaving them pointing at this harness's chunk buffers would
++    // free the wrong allocation.
++    int*   base_d_pos = nullptr;
++    float* base_bank  = nullptr;
++    cudaStream_t stream = nullptr;
++};
++
++bool setup(Ctx& c, const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions& opt,
++           int n_layers, int max_ctx, int tp_size, int rank, int layer) {
++    // ExpertsAndKda at tp > 1 is what the fleet actually runs: the KDA heads band, so
++    // qkv narrows from n_q_heads*head_dim to this rank's share and the recurrent state
++    // divides with it. Testing only the tp=1 geometry would leave the shipped shape
++    // unproven -- a batched kernel that is fine at qkv 12288 and wrong at 4096 is
++    // exactly the kind of shape dependence this is looking for.
++    c.w.policy = (tp_size > 1) ? KimiK3Weights::ShardPolicy::ExpertsAndKda
++                               : KimiK3Weights::ShardPolicy::ExpertsOnly;
++    c.w.shard.tp_size = tp_size;
++    c.w.shard.rank = rank;
++    c.w.shard.hidden = cfg.hidden;
++    c.w.shard.n_experts_total = cfg.n_experts;
++    c.w.shard.n_experts = cfg.n_experts;
++    c.w.shard.expert_band = tp::Band{0, cfg.n_experts};
++    c.w.shard.experts_sharded = false;
++    c.w.shard.moe_ffn_total = cfg.moe_ffn;
++    c.w.shard.moe_ffn = cfg.moe_ffn;
++    c.w.shard.moe_shard_mode = tp::MoeShardMode::None;
++
++    // A MoE layer's expert tensors need a legal mode at tp>1 or the loader refuses
++    // them. Irrelevant to this comparison -- only the Attn phase runs -- but it has
++    // to load.
++    if (tp_size > 1 && layer >= cfg.leading_dense) {
++        const tp::ShardError e = tp::moe_all_expert_width_dims(
++            cfg.n_experts, cfg.moe_ffn, tp_size, rank, 256, &c.w.shard);
++        if (!e.ok()) { std::printf("  width dims: %s\n", e.message.c_str()); return false; }
++        c.w.shard.hidden = cfg.hidden;
++    }
++
++    if (!kimi_k3_load_weights(g, cfg, opt, c.w, 0, n_layers - 1)) return false;
++    // The KDA state must be sized to THIS RANK's heads, or the forward indexes past
++    // the end of the allocation.
++    if (!kimi_k3_alloc_state(cfg, max_ctx, c.st, 0, n_layers - 1,
++                             tp_size > 1 ? &c.w.kda : nullptr)) return false;
++    c.fwd.cfg = &cfg; c.fwd.w = &c.w; c.fwd.state = &c.st;
++    c.fwd.opt = opt;
++    // A REAL STREAM, not the legacy default one, because the chunk driver captures its
++    // chunk into a CUDA graph and the legacy stream cannot be captured. Capture is the
++    // one structural difference left between this harness and the driver that faulted,
++    // so the harness has to be able to enter it.
++    if (cudaStreamCreateWithFlags(&c.stream, cudaStreamNonBlocking) != cudaSuccess)
++        return false;
++    c.fwd.stream = c.stream;
++    if (!kimi_k3_forward_alloc_scratch(cfg, c.fwd)) return false;
++    c.base_d_pos = c.st.d_pos;
++    c.base_bank  = c.st.res_bank;
++    return true;
++}
++
++void teardown(Ctx& c) {
++    c.st.d_pos    = c.base_d_pos;
++    c.st.res_bank = c.base_bank;
++    if (c.stream) cudaStreamDestroy(c.stream);
++    kimi_k3_forward_free_scratch(c.fwd);
++    kimi_k3_free_state(c.st);
++    kimi_k3_free_weights(c.w);
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    if (argc < 2) {
++        std::fprintf(stderr,
++                     "usage: %s <first-shard.gguf> [Kmax] [layer] [tp_size] [rank] "
++                     "[full]\n",
++                     argv[0]);
++        return 2;
++    }
++    const std::string path = argv[1];
++    const int Kmax    = argc > 2 ? std::atoi(argv[2]) : 8;
++    const int tp_size = argc > 4 ? std::atoi(argv[4]) : 1;
++    const int rank    = argc > 5 ? std::atoi(argv[5]) : 0;
++    // "full": run layers 0..layer through phase All instead of one layer's Attn.
++    const bool full   = argc > 6 && std::string(argv[6]) == "full";
++
++    GGUF g; KimiK3Config cfg; KimiK3LayerCoverage cov;
++    if (!kimi_k3_load_partial(path.c_str(), cfg, g, &cov)) {
++        std::printf("load failed\n"); return 1;
++    }
++    int n_avail = 0;
++    while (n_avail < cfg.n_layers && cov.layer_complete[n_avail]) ++n_avail;
++
++    // An explicit layer may be MLA: the batched Attn phase takes both layer types and
++    // the MLA half has been on by default all along, so it is the control arm -- if MLA
++    // batching also faults in this harness the fault is not KDA-specific.
++    int layer = argc > 3 ? std::atoi(argv[3]) : -1;
++    if (layer < 0)
++        for (int i = 0; i < n_avail; ++i) if (cfg.is_kda_layer(i)) { layer = i; break; }
++    if (layer < 0 || layer >= n_avail) {
++        std::printf("layer %d not available (n_avail=%d)\n", layer, n_avail);
++        return 1;
++    }
++    const int n_layers = layer + 1;
++
++    K3PlanOptions opt;
++    {
++        const std::string p = "blk." + std::to_string(layer) + ".";
++        opt.has_q_lora         = g.tensor((p + "attn_q_a.weight").c_str()) != nullptr;
++        opt.has_attn_gate      = g.tensor((p + "attn_gate.weight").c_str()) != nullptr;
++        opt.has_shared_experts = g.tensor((p + "ffn_gate_shexp.weight").c_str()) != nullptr;
++        opt.has_routed_norm    = g.tensor((p + "ffn_routed_norm.weight").c_str()) != nullptr;
++    }
++
++    const int H = cfg.hidden;
++    const int max_ctx = Kmax + 8;
++
++    Ctx c;
++    if (!setup(c, g, cfg, opt, n_layers, max_ctx, tp_size, rank, layer)) {
++        std::printf("setup failed\n"); return 1;
++    }
++
++    const int cap = kimi_k3_ffn_batch_cap(c.fwd);
++    std::printf("batched-Attn equivalence: layer %d (%s), hidden %d, n_q_heads %d, "
++                "kda_head_dim %d, tp %d rank %d, scratch cap %d\n",
++                layer, cfg.is_kda_layer(layer) ? "KDA" : "MLA", H, cfg.n_q_heads,
++                cfg.kda_head_dim, tp_size, rank, cap);
++    if (cfg.is_kda_layer(layer))
++        std::printf("  kda heads=%d qkv_band=[%d,%d) head_band=[%d,%d)\n",
++                    c.w.kda.n_heads, c.w.kda.qkv_band.offset, c.w.kda.qkv_band.end(),
++                    c.w.kda.head_band.offset, c.w.kda.head_band.end());
++    if (cap < Kmax) {
++        std::printf("  scratch cap %d < Kmax %d -- raise SPARKINFER_K3_PREFILL_CHUNK\n",
++                    cap, Kmax);
++        teardown(c); return 1;
++    }
++    std::printf("  attn_batch_ok(layer %d, n_tok 2) = %s\n", layer,
++                kimi_k3_attn_batch_ok(c.fwd, layer, 2) ? "true"
++                    : "FALSE (set SPARKINFER_K3_KDA_QKVG_BATCH=1)");
++
++    // ---- inputs: Kmax distinct hidden rows, token-major and CONTIGUOUS at exactly H.
++    // Contiguity is load-bearing rather than convenient: the batched activation
++    // quantise is flat over 32-element blocks and has no row index to apply a stride
++    // to, so a padded leading dimension would quantise the padding as data.
++    std::mt19937 rng(20260811);
++    std::normal_distribution<float> N01(0.f, 1.f);
++    std::vector<float> host_in((size_t)Kmax * H);
++    for (auto& v : host_in) v = N01(rng);
++
++    float* d_in = nullptr; float* d_alt = nullptr;
++    int*   d_pos_vec = nullptr; float* d_bank = nullptr;
++    const int    max_ckpt   = c.st.max_ckpt;
++    const size_t bank_elems = (size_t)max_ckpt * (size_t)c.st.res_bank_row_elems;
++    cudaMalloc(&d_in,  (size_t)Kmax * H * sizeof(float));
++    cudaMalloc(&d_alt, (size_t)Kmax * H * sizeof(float));
++    cudaMalloc(&d_pos_vec, (size_t)Kmax * sizeof(int));
++    if (bank_elems) cudaMalloc(&d_bank, (size_t)Kmax * bank_elems * sizeof(float));
++
++    if (full)
++        std::printf("  FULL mode: layers 0..%d, phase All, max_ckpt %d (banks %s)\n",
++                    n_layers - 1, max_ckpt, max_ckpt > 1 ? "TWICE - stride exposed"
++                                                         : "once - stride NOT exposed");
++
++    // Walk `x` through every loaded layer, ping-ponging into `xn`. Returns the buffer
++    // the result landed in, or null on failure. Both arms run the same layer count so
++    // the parity -- and therefore which buffer holds the answer -- matches.
++    auto run_stack = [&](float* x, float* xn, int n_tok) -> float* {
++        for (int l = 0; l < n_layers; ++l) {
++            if (!kimi_k3_forward_layer_phase(c.fwd, l, K3LayerPhase::All, x, xn, n_tok))
++                return nullptr;
++            float* t = x; x = xn; xn = t;
++        }
++        return x;
++    };
++
++    int fails = 0;
++    for (int K = 2; K <= Kmax; ++K) {
++        std::vector<float> seq((size_t)K * H, 0.f), bat((size_t)K * H, 0.f);
++
++        // ---- arm A: K sequential single-token calls, state carried across them ----
++        kimi_k3_reset_state(c.st);
++        bool ok_seq = true;
++        for (int b = 0; b < K && ok_seq; ++b) {
++            kimi_k3_set_position(c.st, b);
++            if (d_bank) c.st.res_bank = d_bank + (size_t)b * bank_elems;
++            // n_ckpt is reset at the top of every forward call -- the bank is
++            // intra-token scratch, not cross-step state -- so token b starts at 0
++            // exactly as kimi_k3_dist_forward_token does.
++            c.st.n_ckpt = 0;
++            cudaMemcpy(d_in + (size_t)b * H, host_in.data() + (size_t)b * H,
++                       (size_t)H * sizeof(float), cudaMemcpyHostToDevice);
++            if (full) {
++                float* got = run_stack(d_in + (size_t)b * H, d_alt + (size_t)b * H, 1);
++                ok_seq = got != nullptr;
++                if (ok_seq) cudaStreamSynchronize(c.stream);
++                if (ok_seq)
++                    cudaMemcpy(seq.data() + (size_t)b * H, got, (size_t)H * sizeof(float),
++                               cudaMemcpyDeviceToHost);
++            } else {
++                ok_seq = kimi_k3_forward_layer_phase(c.fwd, layer, K3LayerPhase::Attn,
++                                                     d_in + (size_t)b * H,
++                                                     d_alt + (size_t)b * H, 1);
++                if (ok_seq) {
++                    cudaStreamSynchronize(c.stream);
++                    int n = 0;
++                    float* part = kimi_k3_partial_buffer(c.fwd, layer,
++                                                         K3LayerPhase::Attn, &n);
++                    cudaMemcpy(seq.data() + (size_t)b * H, part,
++                               (size_t)H * sizeof(float), cudaMemcpyDeviceToHost);
++                }
++            }
++        }
++        c.st.res_bank = c.base_bank;
++        if (!ok_seq) {
++            std::printf("K=%d: SEQUENTIAL arm FAILED\n", K);
++            ++fails; continue;
++        }
++
++        // ---- arm B: one batched call over the same K rows ----
++        kimi_k3_reset_state(c.st);
++        kimi_k3_set_position(c.st, 0);
++        // Token b's position is d_pos[b]; state.position is TOKEN 0's. Handing the
++        // batched phase a single shared position is the "every token attends over the
++        // same prefix" bug -- wrong AND faster, so a timing run cannot see it.
++        k3k::k3_fill_pos_vec(d_pos_vec, c.st.d_pos, K, c.stream);
++        cudaStreamSynchronize(c.stream);
++        c.st.d_pos = d_pos_vec;
++        if (d_bank) c.st.res_bank = d_bank;
++        c.st.n_ckpt = 0;
++        cudaMemcpy(d_in, host_in.data(), (size_t)K * H * sizeof(float),
++                   cudaMemcpyHostToDevice);
++        bool ok_bat = true;
++        if (full) {
++            float* got = run_stack(d_in, d_alt, K);
++            ok_bat = got != nullptr;
++            if (ok_bat) cudaStreamSynchronize(c.stream);
++            if (ok_bat)
++                cudaMemcpy(bat.data(), got, (size_t)K * H * sizeof(float),
++                           cudaMemcpyDeviceToHost);
++        } else {
++            ok_bat = kimi_k3_forward_layer_phase(c.fwd, layer, K3LayerPhase::Attn,
++                                                 d_in, d_alt, K);
++            if (ok_bat) {
++                cudaStreamSynchronize(c.stream);
++                // The Attn partial strides by `hidden` per token; kimi_k3_partial_buffer
++                // reports ONE token's width, so the K-row read is computed here rather
++                // than taken from it. That asymmetry is the exact trap a distributed
++                // batched port has to avoid when it sizes an all-reduce.
++                int n = 0;
++                float* part = kimi_k3_partial_buffer(c.fwd, layer,
++                                                     K3LayerPhase::Attn, &n);
++                cudaMemcpy(bat.data(), part, (size_t)K * H * sizeof(float),
++                           cudaMemcpyDeviceToHost);
++            }
++        }
++        c.st.d_pos    = c.base_d_pos;
++        c.st.res_bank = c.base_bank;
++        if (!ok_bat) {
++            std::printf("K=%d: BATCHED arm FAILED (see the LAUNCH FAILED line above)\n", K);
++            ++fails; continue;
++        }
++
++        // A DIGEST OF THE RAW BYTES, printed for both arms. Within one binary the diff
++        // below is the real check; the digest is what makes an ACROSS-BINARY comparison
++        // possible, which is the only way to prove a pure memory-layout refactor (the
++        // KDA state arenas) changed no computed value. FNV-1a over the float bytes, so
++        // a one-ULP move shows up.
++        auto digest = [](const std::vector<float>& v) {
++            uint64_t h = 1469598103934665603ULL;
++            const unsigned char* p = (const unsigned char*)v.data();
++            for (size_t i = 0; i < v.size() * sizeof(float); ++i)
++                { h ^= p[i]; h *= 1099511628211ULL; }
++            return h;
++        };
++        std::printf("K=%d: digest seq=%016llx bat=%016llx\n", K,
++                    (unsigned long long)digest(seq), (unsigned long long)digest(bat));
++
++        size_t n_diff = 0; double worst = 0; int worst_i = -1;
++        for (size_t i = 0; i < seq.size(); ++i) {
++            if (std::memcmp(&seq[i], &bat[i], sizeof(float)) != 0) {
++                ++n_diff;
++                const double d = std::fabs((double)seq[i] - (double)bat[i]);
++                const double rel = d / (std::fabs((double)seq[i]) + 1e-9);
++                if (rel > worst) { worst = rel; worst_i = (int)i; }
++            }
++        }
++        if (n_diff == 0) {
++            std::printf("K=%d: PASS  %zu elems bit-identical\n", K, seq.size());
++        } else {
++            std::printf("K=%d: FAIL  %zu/%zu elems differ, worst_rel %.3e @ %d "
++                        "(seq=%.9g bat=%.9g)\n",
++                        K, n_diff, seq.size(), worst, worst_i,
++                        worst_i >= 0 ? seq[(size_t)worst_i] : 0.f,
++                        worst_i >= 0 ? bat[(size_t)worst_i] : 0.f);
++            ++fails;
++        }
++    }
++
++    cudaFree(d_in); cudaFree(d_alt); cudaFree(d_pos_vec);
++    if (d_bank) cudaFree(d_bank);
++    teardown(c);
++
++    std::printf("\n%s: batched %s %s K sequential calls for K=2..%d\n",
++                fails == 0 ? "PASS" : "FAIL",
++                full ? "full-stack forward" : "Attn phase",
++                fails == 0 ? "reproduces" : "DOES NOT reproduce", Kmax);
++    return fails == 0 ? 0 : 1;
++}
+diff --git a/runtime/include/sparkinfer/models/kimi_k3.h b/runtime/include/sparkinfer/models/kimi_k3.h
+index 6a210c3..5b791ba 100644
+--- a/runtime/include/sparkinfer/models/kimi_k3.h
++++ b/runtime/include/sparkinfer/models/kimi_k3.h
+@@ -289,9 +289,38 @@ struct KimiK3RuntimeState {
+ 
+     // Indexed by KDA-layer ordinal (0..n_kda_layers-1), NOT the global layer index —
+     // see kda_layer_ordinal() below.
++    //
++    // THESE ARE OFFSETS INTO THE FOUR ARENAS BELOW, NOT INDEPENDENT ALLOCATIONS. Every
++    // reader keeps indexing them exactly as before; only where they point changed.
+     std::vector<float*> conv_state_q, conv_state_k, conv_state_v;   // [d_conv-1, qkv]
+     std::vector<float*> delta_state;                               // [head_dim, head_dim, n_head]
+ 
++    // ---- THE KDA STATE ARENAS: one contiguous allocation per buffer kind ----
++    //
++    // The recurrent state used to be 4 cudaMallocs per KDA layer — 276 separate
++    // allocations at 69 layers. Nothing about the forward cared, because it only ever
++    // touches one layer's slot at a time. What cares is anything that moves the WHOLE
++    // state at once: a snapshot/restore for speculative rollback is 276 memcpys against
++    // a ~1.7 us launch floor (~0.47 ms of pure overhead per save) when the slots are
++    // scattered, and 4 when they are not. Qwen35Model already allocates its recurrent
++    // state this way, which is why its spec-decode snapshot is 2 memcpys
++    // (qwen35.cpp:282, :1752-1777); this is the same move for K3.
++    //
++    // Slots are packed in ASCENDING KDA ORDINAL over the layers THIS STAGE OWNS, so a
++    // pipeline stage that owns layers 40..52 gets a dense arena of 13 slots and the
++    // ordinals outside its range stay null in the vectors above — the property that
++    // keeps a stage from allocating the whole model's state. `n_kda_owned` is that slot
++    // count, and it is what a bulk copy must use, NOT n_kda_layers.
++    //
++    // Null when this stage owns no KDA layer. A bulk copy of kind X is then
++    //   cudaMemcpyAsync(dst, X_arena, n_kda_owned * <X>_elems * sizeof(float), ...)
++    // and it is contiguous by construction.
++    float* conv_q_arena = nullptr;
++    float* conv_k_arena = nullptr;
++    float* conv_v_arena = nullptr;
++    float* delta_arena  = nullptr;
++    int    n_kda_owned  = 0;
++
+     // Indexed by MLA-layer ordinal (0..n_mla_layers-1).
+     //
+     // Element type is f16 when kv_f16 is set (the default — llama.cpp's own
+@@ -487,10 +516,10 @@ enum class K3LayerPhase {
+ //     There is no launch that does that for n_tok tokens without becoming a different
+ //     algorithm with a different summation order, so THE SCAN stays a per-token loop in
+ //     index order and always will. What is split off from it, under
+-//     SPARKINFER_K3_KDA_QKVG_BATCH (DEFAULT OFF), is the PROJECTION half: q/k/v/g and
+-//     attn_output are elementwise in the token index, so they are issued once for the
+-//     chunk and the scan loop consumes/produces their rows in order. With the gate
+-//     unset a KDA layer is refused exactly as before.
++//     SPARKINFER_K3_KDA_QKVG_BATCH (DEFAULT ON since 2026-08-11), is the PROJECTION
++//     half: q/k/v/g and attn_output are elementwise in the token index, so they are
++//     issued once for the chunk and the scan loop consumes/produces their rows in
++//     order. =0 refuses a KDA layer exactly as before.
+ //
+ // Ask kimi_k3_attn_batch_ok() rather than inferring either half. Refusing is
+ // deliberate and stays deliberate: the previous version of the chunk driver was fast
+@@ -528,9 +557,9 @@ int kimi_k3_ffn_batch_cap(const KimiK3Forward& fwd);
+ // per-token loop, and inferring the answer from the layer type alone would miss the
+ // scratch cap, the debug mode and SPARKINFER_K3_ATTN_BATCH=0 — each of which makes the
+ // phase refuse, which is a FAILED prefill rather than a slow one. False for n_tok == 1
+-// (there is nothing to batch), for every KDA layer unless SPARKINFER_K3_KDA_QKVG_BATCH
+-// is set (the conv and delta-rule recurrences keep the scan per-token; only the
+-// projections batch), and whenever the batched path is gated off.
++// (there is nothing to batch), for every KDA layer under
++// SPARKINFER_K3_KDA_QKVG_BATCH=0 (the conv and delta-rule recurrences keep the scan
++// per-token; only the projections batch), and whenever the batched path is gated off.
+ bool kimi_k3_attn_batch_ok(const KimiK3Forward& fwd, int layer, int n_tok);
+ 
+ // The buffer holding THIS RANK'S partial sum after `phase`, and its element count.
+diff --git a/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h b/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h
+index 0f9be00..fb0fe0d 100755
+--- a/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h
++++ b/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h
+@@ -29,6 +29,36 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+                                 float* out_logits_host,
+                                 std::string* error = nullptr);
+ 
++// ---------------------------------------------------------------------------
++// K-TOKEN BATCHED DECODE STEP — the distributed twin of kimi_k3_tp_prefill_chunk.
++// ---------------------------------------------------------------------------
++//
++// Runs n_tok tokens through all 93 layers in ONE pass, so every dense weight is
++// streamed once for the batch instead of once per token, and each layer issues ONE
++// collective per phase over an n_tok-wide payload instead of n_tok collectives. That
++// is what a speculative verify pass needs: 92.9% of a decode token's bytes are dense
++// and amortise perfectly here, and the 185 all-reduces per token become 185 per pass.
++//
++// NO DRAFTING AND NO ROLLBACK. This runs the tokens it is given and leaves the
++// recurrent state having consumed all n_tok of them. It exists to prove batched
++// verification is correct and to measure what an extra verified position costs; a
++// caller that wants to reject a suffix needs the state snapshot/restore that does not
++// exist yet, and must not use this to speculate until it does.
++//
++// out_logits_host, on rank 0, is [n_tok, vocab] ROW-MAJOR — token b's logits at
++// (out_logits_host + b*vocab). Workers pass nullptr. Both are the same contract as
++// the single-token entry point, widened by a row axis.
++//
++// PRECONDITION the caller owns: token_ids are the tokens to consume IN ORDER starting
++// at the rank's current position. The KDA delta rule and conv window are carried
++// token to token inside the pass, so the order is the recurrence order.
++bool kimi_k3_dist_forward_batch(KimiK3DistRank& rank,
++                                tp::dist::RankCollective& coll,
++                                const int* token_ids,
++                                int n_tok,
++                                float* out_logits_host,
++                                std::string* error = nullptr);
++
+ // Prefill: run each prompt id through dist_forward_token; keep only final logits
+ // on rank 0 (same contract as kimi_k3_generate pipeline prefill).
+ bool kimi_k3_dist_forward_prompt(KimiK3DistRank& rank,
+diff --git a/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h b/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
+index 7c43f17..6b3559a 100755
+--- a/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
++++ b/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
+@@ -21,10 +21,28 @@ struct KimiK3DistRank {
+     KimiK3Forward fwd;
+     float* x = nullptr;
+     float* x_next = nullptr;
+-    float* logits = nullptr;  // [vocab], rank 0 only
++    float* logits = nullptr;  // [batch_cap, vocab] on rank 0; one row when batch_cap<=1
+     cudaStream_t stream = nullptr;
+     int device = 0;
+     bool loaded = false;
++
++    // ---- K-TOKEN BATCH SCRATCH, allocated lazily by kimi_k3_dist_forward_batch ----
++    //
++    // Separate from x/x_next rather than a resize of them, because the single-token
++    // path's pointers are swapped 93 times per token and are the addresses everything
++    // else in this struct is reasoned about. batch_cap == 0 means the batched entry
++    // point has never been called and this rank costs exactly what it did before.
++    //
++    // The PARTIAL buffers are deliberately absent: kimi_k3_forward_alloc_scratch
++    // already sizes the Attn partial at hidden*cap and the MoE partial at
++    // (expert_latent+hidden)*cap, contiguous with those per-token strides. What a
++    // batched driver must supply is not a buffer but the right COUNT at the
++    // collective — see kimi_k3_dist_forward_batch.
++    float* xb = nullptr;        // [batch_cap, hidden]
++    float* xb_next = nullptr;   // [batch_cap, hidden]
++    int*   pos_vec = nullptr;   // [batch_cap], token b's position at pos_vec[b]
++    float* bank_b = nullptr;    // [batch_cap, max_ckpt * hidden]
++    int    batch_cap = 0;
+ };
+ 
+ struct KimiK3DistRankLoadOptions {
+diff --git a/runtime/src/models/kimi_k3.cpp b/runtime/src/models/kimi_k3.cpp
+index 9c9d516..2697604 100644
 --- a/runtime/src/models/kimi_k3.cpp
 +++ b/runtime/src/models/kimi_k3.cpp
-@@ -768,16 +768,40 @@
+@@ -759,16 +759,40 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
      out.delta_state.assign(n_kda, nullptr);
      out.mla_kv_cache.assign(n_mla, nullptr);
  
@@ -48,7 +1073,7 @@
          } else {
              const int k = kimi_k3_mla_ordinal(cfg, layer);
              // f16 rows are half the bytes; alloc() counts floats, so round the
-@@ -831,10 +855,14 @@
+@@ -822,10 +846,14 @@ void kimi_k3_reset_state(KimiK3RuntimeState& s) {
      auto z = [](float* p, size_t n_elems) {
          if (p && n_elems > 0) cudaMemset(p, 0, n_elems * sizeof(float));
      };
@@ -67,7 +1092,7 @@
      // kv_cache_elems counts CACHE ELEMENTS, which are 2 bytes under kv_f16 —
      // zeroed by bytes here so the f16 arm doesn't memset past its allocation.
      // (All-zero bits is 0.0 in both f32 and f16, so the cleared state means the
-@@ -852,6 +880,10 @@
+@@ -843,6 +871,10 @@ void kimi_k3_free_state(KimiK3RuntimeState& s) {
      s.owned.clear();
      s.conv_state_q.clear(); s.conv_state_k.clear(); s.conv_state_v.clear();
      s.delta_state.clear(); s.mla_kv_cache.clear();
@@ -78,21 +1103,13 @@
      s.res_bank = nullptr;
  }
  
-@@ -1377,40 +1409,52 @@
+@@ -1368,40 +1400,52 @@ static bool k3_attn_batch_enabled() {
  //
  // Read in exactly one place for the same reason SPARKINFER_K3_ATTN_BATCH is: the driver
  // picks between one batched call and a per-token loop by asking the same predicate the
 -// phase enforces, so the two cannot disagree. Default OFF until measured — the scored
 -// build must not move under an unmeasured scheduling change.
 -// MEASURED 2026-08-06 ON 8xH200 AT THE SCORED SHAPE, which is why this now defaults ON.
--//
--// It was gated off because it had never been run at 32k, and the rule this file keeps is
--// that the shipped build does not move under an unmeasured scheduling change. It has now
--// been measured, on one binary against the same binary with the gate off, in one session:
--//
--// on one binary against the same binary with the gate off, in one session, and the logits
--// are BYTE-IDENTICAL between the two — so this buys throughput without touching the
--// arithmetic. That is the whole reason it can be defaulted on rather than left as a knob.
 +// phase enforces, so the two cannot disagree.
 +//
 +// ---- WHY THIS IS BACK ON BY DEFAULT (2026-08-11), AND WHAT WAS ACTUALLY MEASURED ----
@@ -102,7 +1119,10 @@
 +// for every chunk >= 2 tokens. The gate was described in its own comment as "the safe
 +// half of that question, not the answer to it" — the feature was disabled, the fault was
 +// never diagnosed, and nothing re-tested it afterwards.
-+//
+ //
+-// It was gated off because it had never been run at 32k, and the rule this file keeps is
+-// that the shipped build does not move under an unmeasured scheduling change. It has now
+-// been measured, on one binary against the same binary with the gate off, in one session:
 +// THAT FAULT DOES NOT REPRODUCE ON THIS TREE. #148 shipped TWO defects together (see
 +// CHANGELOG): this gate being read opt-out, and a residual-bank stride swap in which a
 +// launcher taking `(n_rows, act_row_stride, bank_row_stride)` was called as
@@ -111,12 +1131,17 @@
 +// off for was never separated from its sibling. The stride defect made the batched arm
 +// read activations at 8x their true pitch, off the end of the buffer — which is the kind
 +// of thing that leaves a context error for the next launch to report.
-+//
+ //
+-// on one binary against the same binary with the gate off, in one session, and the logits
+-// are BYTE-IDENTICAL between the two — so this buys throughput without touching the
+-// arithmetic. That is the whole reason it can be defaulted on rather than left as a knob.
 +// kimi_k3_kda_batch_check is the harness that was missing. It runs ONE layer on ONE GPU
 +// in seconds, and it asserts BITWISE equality (not a tolerance) between
 +// kimi_k3_forward_layer_phase(Attn, n_tok=K) and K sequential n_tok=1 calls over the
 +// same rows, with the recurrent state carried across both arms. Measured on GB10:
-+//
+ //
+-// SPARKINFER_K3_KDA_QKVG_BATCH=0 restores the per-token group on the same binary, so the
+-// A/B that produced those numbers stays reproducible.
 +//   * KDA layer 0, tp=1 and tp=3 on all three ranks (qkv bands [0,4096) [4096,8192)
 +//     [8192,12288)), K = 2..8: bit-identical, no fault.
 +//   * KDA layer 0, tp=3 rank 0, K = 2..64 at a chunk cap of 64: bit-identical.
@@ -133,9 +1158,7 @@
 +// left between the harness and the driver that originally faulted. This fleet runs the
 +// distributed path, which does not capture a batched forward, so that gap is not on the
 +// path this default was flipped for. A caller that does capture should A/B with =0.
- //
--// SPARKINFER_K3_KDA_QKVG_BATCH=0 restores the per-token group on the same binary, so the
--// A/B that produced those numbers stays reproducible.
++//
 +// SPARKINFER_K3_KDA_QKVG_BATCH=0 restores the per-token group on the same binary.
  static bool k3_kda_qkvg_batch_enabled() {
      static const bool on = [] {
@@ -161,7 +1184,7 @@
      }();
      return on;
  }
-@@ -1465,8 +1509,9 @@
+@@ -1456,8 +1500,9 @@ bool kimi_k3_attn_batch_ok(const KimiK3Forward& fwd, int layer, int n_tok) {
      //
      // What it no longer refuses outright is the PROJECTION half. q/k/v/g and attn_output
      // are elementwise in the token index, so under SPARKINFER_K3_KDA_QKVG_BATCH they run
@@ -173,78 +1196,11 @@
      if (fwd.cfg->is_kda_layer(layer) && !k3_kda_qkvg_batch_enabled()) return false;
      // The debug taps read a scratch buffer straight after the launch that wrote it and
      // report ONE vector. On a batched phase they would report row 0 and silently say
---- a/runtime/include/sparkinfer/models/kimi_k3.h
-+++ b/runtime/include/sparkinfer/models/kimi_k3.h
-@@ -289,9 +289,38 @@
- 
-     // Indexed by KDA-layer ordinal (0..n_kda_layers-1), NOT the global layer index —
-     // see kda_layer_ordinal() below.
-+    //
-+    // THESE ARE OFFSETS INTO THE FOUR ARENAS BELOW, NOT INDEPENDENT ALLOCATIONS. Every
-+    // reader keeps indexing them exactly as before; only where they point changed.
-     std::vector<float*> conv_state_q, conv_state_k, conv_state_v;   // [d_conv-1, qkv]
-     std::vector<float*> delta_state;                               // [head_dim, head_dim, n_head]
- 
-+    // ---- THE KDA STATE ARENAS: one contiguous allocation per buffer kind ----
-+    //
-+    // The recurrent state used to be 4 cudaMallocs per KDA layer — 276 separate
-+    // allocations at 69 layers. Nothing about the forward cared, because it only ever
-+    // touches one layer's slot at a time. What cares is anything that moves the WHOLE
-+    // state at once: a snapshot/restore for speculative rollback is 276 memcpys against
-+    // a ~1.7 us launch floor (~0.47 ms of pure overhead per save) when the slots are
-+    // scattered, and 4 when they are not. Qwen35Model already allocates its recurrent
-+    // state this way, which is why its spec-decode snapshot is 2 memcpys
-+    // (qwen35.cpp:282, :1752-1777); this is the same move for K3.
-+    //
-+    // Slots are packed in ASCENDING KDA ORDINAL over the layers THIS STAGE OWNS, so a
-+    // pipeline stage that owns layers 40..52 gets a dense arena of 13 slots and the
-+    // ordinals outside its range stay null in the vectors above — the property that
-+    // keeps a stage from allocating the whole model's state. `n_kda_owned` is that slot
-+    // count, and it is what a bulk copy must use, NOT n_kda_layers.
-+    //
-+    // Null when this stage owns no KDA layer. A bulk copy of kind X is then
-+    //   cudaMemcpyAsync(dst, X_arena, n_kda_owned * <X>_elems * sizeof(float), ...)
-+    // and it is contiguous by construction.
-+    float* conv_q_arena = nullptr;
-+    float* conv_k_arena = nullptr;
-+    float* conv_v_arena = nullptr;
-+    float* delta_arena  = nullptr;
-+    int    n_kda_owned  = 0;
-+
-     // Indexed by MLA-layer ordinal (0..n_mla_layers-1).
-     //
-     // Element type is f16 when kv_f16 is set (the default — llama.cpp's own
-@@ -487,10 +516,10 @@
- //     There is no launch that does that for n_tok tokens without becoming a different
- //     algorithm with a different summation order, so THE SCAN stays a per-token loop in
- //     index order and always will. What is split off from it, under
--//     SPARKINFER_K3_KDA_QKVG_BATCH (DEFAULT OFF), is the PROJECTION half: q/k/v/g and
--//     attn_output are elementwise in the token index, so they are issued once for the
--//     chunk and the scan loop consumes/produces their rows in order. With the gate
--//     unset a KDA layer is refused exactly as before.
-+//     SPARKINFER_K3_KDA_QKVG_BATCH (DEFAULT ON since 2026-08-11), is the PROJECTION
-+//     half: q/k/v/g and attn_output are elementwise in the token index, so they are
-+//     issued once for the chunk and the scan loop consumes/produces their rows in
-+//     order. =0 refuses a KDA layer exactly as before.
- //
- // Ask kimi_k3_attn_batch_ok() rather than inferring either half. Refusing is
- // deliberate and stays deliberate: the previous version of the chunk driver was fast
-@@ -528,9 +557,9 @@
- // per-token loop, and inferring the answer from the layer type alone would miss the
- // scratch cap, the debug mode and SPARKINFER_K3_ATTN_BATCH=0 — each of which makes the
- // phase refuse, which is a FAILED prefill rather than a slow one. False for n_tok == 1
--// (there is nothing to batch), for every KDA layer unless SPARKINFER_K3_KDA_QKVG_BATCH
--// is set (the conv and delta-rule recurrences keep the scan per-token; only the
--// projections batch), and whenever the batched path is gated off.
-+// (there is nothing to batch), for every KDA layer under
-+// SPARKINFER_K3_KDA_QKVG_BATCH=0 (the conv and delta-rule recurrences keep the scan
-+// per-token; only the projections batch), and whenever the batched path is gated off.
- bool kimi_k3_attn_batch_ok(const KimiK3Forward& fwd, int layer, int n_tok);
- 
- // The buffer holding THIS RANK'S partial sum after `phase`, and its element count.
+diff --git a/runtime/src/models/kimi_k3_dist_forward.cpp b/runtime/src/models/kimi_k3_dist_forward.cpp
+index 7e8deaa..ed96242 100755
 --- a/runtime/src/models/kimi_k3_dist_forward.cpp
 +++ b/runtime/src/models/kimi_k3_dist_forward.cpp
-@@ -513,6 +513,293 @@
+@@ -513,6 +513,293 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
      return true;
  }
  
@@ -538,497 +1494,6 @@
  bool kimi_k3_dist_forward_prompt(KimiK3DistRank& rank,
                                   tp::dist::RankCollective& coll,
                                   const int* ids,
---- a/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h
-+++ b/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h
-@@ -29,6 +29,36 @@
-                                 float* out_logits_host,
-                                 std::string* error = nullptr);
- 
-+// ---------------------------------------------------------------------------
-+// K-TOKEN BATCHED DECODE STEP — the distributed twin of kimi_k3_tp_prefill_chunk.
-+// ---------------------------------------------------------------------------
-+//
-+// Runs n_tok tokens through all 93 layers in ONE pass, so every dense weight is
-+// streamed once for the batch instead of once per token, and each layer issues ONE
-+// collective per phase over an n_tok-wide payload instead of n_tok collectives. That
-+// is what a speculative verify pass needs: 92.9% of a decode token's bytes are dense
-+// and amortise perfectly here, and the 185 all-reduces per token become 185 per pass.
-+//
-+// NO DRAFTING AND NO ROLLBACK. This runs the tokens it is given and leaves the
-+// recurrent state having consumed all n_tok of them. It exists to prove batched
-+// verification is correct and to measure what an extra verified position costs; a
-+// caller that wants to reject a suffix needs the state snapshot/restore that does not
-+// exist yet, and must not use this to speculate until it does.
-+//
-+// out_logits_host, on rank 0, is [n_tok, vocab] ROW-MAJOR — token b's logits at
-+// (out_logits_host + b*vocab). Workers pass nullptr. Both are the same contract as
-+// the single-token entry point, widened by a row axis.
-+//
-+// PRECONDITION the caller owns: token_ids are the tokens to consume IN ORDER starting
-+// at the rank's current position. The KDA delta rule and conv window are carried
-+// token to token inside the pass, so the order is the recurrence order.
-+bool kimi_k3_dist_forward_batch(KimiK3DistRank& rank,
-+                                tp::dist::RankCollective& coll,
-+                                const int* token_ids,
-+                                int n_tok,
-+                                float* out_logits_host,
-+                                std::string* error = nullptr);
-+
- // Prefill: run each prompt id through dist_forward_token; keep only final logits
- // on rank 0 (same contract as kimi_k3_generate pipeline prefill).
- bool kimi_k3_dist_forward_prompt(KimiK3DistRank& rank,
---- a/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
-+++ b/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
-@@ -21,10 +21,28 @@
-     KimiK3Forward fwd;
-     float* x = nullptr;
-     float* x_next = nullptr;
--    float* logits = nullptr;  // [vocab], rank 0 only
-+    float* logits = nullptr;  // [batch_cap, vocab] on rank 0; one row when batch_cap<=1
-     cudaStream_t stream = nullptr;
-     int device = 0;
-     bool loaded = false;
-+
-+    // ---- K-TOKEN BATCH SCRATCH, allocated lazily by kimi_k3_dist_forward_batch ----
-+    //
-+    // Separate from x/x_next rather than a resize of them, because the single-token
-+    // path's pointers are swapped 93 times per token and are the addresses everything
-+    // else in this struct is reasoned about. batch_cap == 0 means the batched entry
-+    // point has never been called and this rank costs exactly what it did before.
-+    //
-+    // The PARTIAL buffers are deliberately absent: kimi_k3_forward_alloc_scratch
-+    // already sizes the Attn partial at hidden*cap and the MoE partial at
-+    // (expert_latent+hidden)*cap, contiguous with those per-token strides. What a
-+    // batched driver must supply is not a buffer but the right COUNT at the
-+    // collective — see kimi_k3_dist_forward_batch.
-+    float* xb = nullptr;        // [batch_cap, hidden]
-+    float* xb_next = nullptr;   // [batch_cap, hidden]
-+    int*   pos_vec = nullptr;   // [batch_cap], token b's position at pos_vec[b]
-+    float* bank_b = nullptr;    // [batch_cap, max_ckpt * hidden]
-+    int    batch_cap = 0;
- };
- 
- struct KimiK3DistRankLoadOptions {
---- a/runtime/examples/kimi_k3_dist_generate.cpp
-+++ b/runtime/examples/kimi_k3_dist_generate.cpp
-@@ -20,6 +20,7 @@
- 
- #include <atomic>
- #include <chrono>
-+#include <cmath>
- #include <cstdio>
- #include <cstdlib>
- #include <cstring>
-@@ -119,11 +120,166 @@
- 
- }  // namespace
- 
-+// ---------------------------------------------------------------------------
-+// --spec-bench: batched-verify correctness + marginal-cost measurement
-+// ---------------------------------------------------------------------------
-+//
-+// Runs IDENTICALLY ON EVERY RANK and sends no control messages. That is deliberate:
-+// the rank protocol carries one token id per step, and widening it is Stage 4's work
-+// (it belongs with the drafter that needs it). Here every rank derives the same verify
-+// tokens from the same --prompt-ids it was already given, so the ranks stay in lockstep
-+// through the NCCL collectives without a protocol change — which keeps this measurement
-+// from depending on a message format nobody has reviewed yet.
-+//
-+// Two things are measured, and they answer different questions:
-+//   1. Does forward_batch(K) agree with K sequential forward_token calls? Reported as
-+//      cosine, top-1 agreement and exact-equality — NOT as a pass/fail. The engine has
-+//      a known numerical-fidelity gap at longer context (near-tied MoE routing under
-+//      IQ1_S), so "batched verify disagrees with sequential decode" is a plausible real
-+//      outcome, and a bare assert would hide the size of it.
-+//   2. What does an extra verified position cost? step(K) for K = 1..Kmax, from which
-+//      the marginal cost m is fitted. Everything downstream of this stage depends on
-+//      that number.
-+static int run_spec_bench(sparkinfer::KimiK3DistRank& dist,
-+                          sparkinfer::tp::dist::RankCollective& coll,
-+                          const std::vector<int>& prompt, int Kmax) {
-+    using clock = std::chrono::steady_clock;
-+    const int rank_id = dist.plan.spec.rank;
-+    const int vocab = dist.cfg.vocab;
-+    const bool r0 = (rank_id == 0);
-+    std::string err;
-+
-+    // The verify tokens are the prompt cycled: deterministic on every rank without a
-+    // message, and in-distribution, so MoE routing (and therefore the expert traffic
-+    // that dominates the marginal cost) stays representative.
-+    auto vtok = [&](int i) { return prompt[(size_t)(i % (int)prompt.size())]; };
-+
-+    auto replay = [&]() -> bool {
-+        sparkinfer::kimi_k3_reset_state(dist.state);
-+        if (cudaStreamSynchronize(dist.stream) != cudaSuccess) return false;
-+        for (size_t i = 0; i < prompt.size(); ++i)
-+            if (!sparkinfer::kimi_k3_dist_forward_token(dist, coll, prompt[i], nullptr,
-+                                                        &err))
-+                return false;
-+        return true;
-+    };
-+
-+    if (r0) {
-+        std::printf("\n[spec-bench] prompt=%zu tokens, Kmax=%d, vocab=%d\n",
-+                    prompt.size(), Kmax, vocab);
-+        std::printf("[spec-bench] --- correctness: forward_batch(K) vs K x forward_token ---\n");
-+        std::fflush(stdout);
-+    }
-+
-+    for (int K = 2; K <= Kmax; ++K) {
-+        std::vector<float> seq(r0 ? (size_t)K * vocab : 0);
-+        std::vector<float> bat(r0 ? (size_t)K * vocab : 0);
-+        std::vector<int> ids((size_t)K);
-+        for (int b = 0; b < K; ++b) ids[(size_t)b] = vtok(b);
-+
-+        if (!replay()) { std::fprintf(stderr, "replay failed: %s\n", err.c_str()); return 1; }
-+        for (int b = 0; b < K; ++b)
-+            if (!sparkinfer::kimi_k3_dist_forward_token(
-+                    dist, coll, ids[(size_t)b],
-+                    r0 ? seq.data() + (size_t)b * vocab : nullptr, &err)) {
-+                std::fprintf(stderr, "seq forward failed: %s\n", err.c_str());
-+                return 1;
-+            }
-+
-+        if (!replay()) { std::fprintf(stderr, "replay failed: %s\n", err.c_str()); return 1; }
-+        if (!sparkinfer::kimi_k3_dist_forward_batch(dist, coll, ids.data(), K,
-+                                                    r0 ? bat.data() : nullptr, &err)) {
-+            std::fprintf(stderr, "batch forward failed: %s\n", err.c_str());
-+            return 1;
-+        }
-+
-+        if (!r0) continue;
-+        for (int b = 0; b < K; ++b) {
-+            const float* a = seq.data() + (size_t)b * vocab;
-+            const float* c = bat.data() + (size_t)b * vocab;
-+            double dot = 0, na = 0, nc = 0, maxabs = 0;
-+            size_t n_exact = 0;
-+            int ta = 0, tc = 0;
-+            for (int i = 0; i < vocab; ++i) {
-+                dot += (double)a[i] * (double)c[i];
-+                na += (double)a[i] * (double)a[i];
-+                nc += (double)c[i] * (double)c[i];
-+                const double d = std::fabs((double)a[i] - (double)c[i]);
-+                if (d > maxabs) maxabs = d;
-+                if (std::memcmp(&a[i], &c[i], sizeof(float)) == 0) ++n_exact;
-+                if (a[i] > a[ta]) ta = i;
-+                if (c[i] > c[tc]) tc = i;
-+            }
-+            const double cos = dot / (std::sqrt(na) * std::sqrt(nc) + 1e-30);
-+            std::printf("[spec-bench] K=%d pos=%d cos=%.9f top1 seq=%d bat=%d %s "
-+                        "max|d|=%.3e exact=%.4f%%\n",
-+                        K, b, cos, ta, tc, ta == tc ? "AGREE" : "**DISAGREE**", maxabs,
-+                        100.0 * (double)n_exact / (double)vocab);
-+        }
-+        std::fflush(stdout);
-+    }
-+
-+    if (r0) {
-+        std::printf("[spec-bench] --- timing: step(K) ---\n");
-+        std::fflush(stdout);
-+    }
-+    // Steady-state only: the first pass after a reset pays cold caches and, on rank 0,
-+    // the one-off logits reallocation. Every rank runs the same counts so the
-+    // collectives stay matched.
-+    const int warm = 2, reps = 5;
-+    std::vector<double> ms_of_K((size_t)Kmax + 1, 0.0);
-+    for (int K = 1; K <= Kmax; ++K) {
-+        if (!replay()) { std::fprintf(stderr, "replay failed: %s\n", err.c_str()); return 1; }
-+        std::vector<int> ids((size_t)K);
-+        double best_sum = 0;
-+        for (int r = 0; r < warm + reps; ++r) {
-+            for (int b = 0; b < K; ++b) ids[(size_t)b] = vtok(r * K + b);
-+            const auto t0 = clock::now();
-+            if (!sparkinfer::kimi_k3_dist_forward_batch(dist, coll, ids.data(), K,
-+                                                        nullptr, &err)) {
-+                std::fprintf(stderr, "timed batch failed: %s\n", err.c_str());
-+                return 1;
-+            }
-+            if (cudaStreamSynchronize(dist.stream) != cudaSuccess) return 1;
-+            const double ms =
-+                std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-+            if (r >= warm) best_sum += ms;
-+        }
-+        ms_of_K[(size_t)K] = best_sum / reps;
-+        if (r0) {
-+            std::printf("[spec-bench] step(K=%d) = %.3f ms   (%.3f ms/token)\n", K,
-+                        ms_of_K[(size_t)K], ms_of_K[(size_t)K] / K);
-+            std::fflush(stdout);
-+        }
-+    }
-+
-+    if (r0 && Kmax >= 2) {
-+        // Least-squares fit of step(K) = T + m*K over K = 1..Kmax. T is the fixed cost
-+        // of a pass and m is what one extra verified position costs -- the number the
-+        // whole speculative-decoding case rests on, and the one thing in the design
-+        // that was modelled rather than measured.
-+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
-+        const int n = Kmax;
-+        for (int K = 1; K <= Kmax; ++K) {
-+            sx += K; sy += ms_of_K[(size_t)K];
-+            sxx += (double)K * K; sxy += (double)K * ms_of_K[(size_t)K];
-+        }
-+        const double m = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-+        const double T = (sy - m * sx) / n;
-+        std::printf("\n[spec-bench] FIT step(K) = %.2f + %.2f*K ms\n", T, m);
-+        std::printf("[spec-bench] marginal cost m = %.2f ms; break-even acceptance "
-+                    "m/step(1) = %.4f\n", m, m / ms_of_K[1]);
-+        std::fflush(stdout);
-+    }
-+    return 0;
-+}
-+
- int main(int argc, char** argv) {
-     int rank = -1, world = 3, device = 0, n_predict = 8, max_ctx = 8192;
-     std::uint64_t session_id = 1;
-     std::string model, listen, coord, prompt_csv, prompt_file, prompts_file;
-     bool dry_protocol = false;
-+    int spec_bench = 0;   // --spec-bench K: batched-verify correctness + step(K) timing
- 
-     for (int i = 1; i < argc; ++i) {
-         auto need = [&](const char* flag) -> const char* {
-@@ -149,6 +305,7 @@
-         else if (!std::strcmp(argv[i], "--session-id"))
-             session_id = (std::uint64_t)std::strtoull(need("--session-id"), nullptr, 10);
-         else if (!std::strcmp(argv[i], "--dry-protocol")) dry_protocol = true;
-+        else if (!std::strcmp(argv[i], "--spec-bench")) spec_bench = std::atoi(need("--spec-bench"));
-         else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
-             usage(argv[0]);
-             return 0;
-@@ -306,6 +463,16 @@
-                     prompts.size(), n_predict, max_ctx);
-         std::fflush(stdout);
- 
-+        // The bench drives every rank through the same call sequence with no control
-+        // messages, so it runs INSTEAD OF the generate loop rather than beside it. The
-+        // workers key off the same flag and enter it instead of wait_token.
-+        if (spec_bench > 0) {
-+            const int rc = run_spec_bench(dist, *coll, prompts[0], spec_bench);
-+            ctr.finish(nullptr);
-+            kimi_k3_dist_rank_free(&dist);
-+            return rc;
-+        }
-+
-         std::vector<float> logits((size_t)dist.cfg.vocab);
- 
-         auto one_step = [&](int tok, float* logits_out) -> bool {
-@@ -484,6 +651,25 @@
-         gen_trace(buf);
-     }
- 
-+    // Workers enter the bench INSTEAD OF wait_token: it exchanges no control messages,
-+    // so a worker sitting in wait_token would never reach the collectives rank 0 is
-+    // about to enter and every rank would hang in NCCL. Both sides key off the same
-+    // flag, and the launcher must pass the same --prompt-ids to every rank because the
-+    // verify tokens are derived from it locally.
-+    if (spec_bench > 0) {
-+        std::vector<int> bench_prompt = prompt_csv.empty()
-+            ? (prompt_file.empty() ? std::vector<int>() : load_ids_file(prompt_file))
-+            : parse_ids_csv(prompt_csv);
-+        if (bench_prompt.empty()) {
-+            std::fprintf(stderr,
-+                         "--spec-bench needs the SAME --prompt-ids on every rank\n");
-+            return 2;
-+        }
-+        const int rc = run_spec_bench(dist, *coll, bench_prompt, spec_bench);
-+        kimi_k3_dist_rank_free(&dist);
-+        return rc;
-+    }
-+
-     for (;;) {
-         int tok = -1;
-         {
---- a/runtime/CMakeLists.txt
-+++ b/runtime/CMakeLists.txt
-@@ -181,6 +181,10 @@
-     target_link_libraries(kimi_k3_tp_kda_check PRIVATE sparkinfer_runtime CUDA::cudart)
-     set_target_properties(kimi_k3_tp_kda_check PROPERTIES CXX_STANDARD 17)
- 
-+    add_executable(kimi_k3_kda_batch_check examples/kimi_k3_kda_batch_check.cpp)
-+    target_link_libraries(kimi_k3_kda_batch_check PRIVATE sparkinfer_runtime CUDA::cudart)
-+    set_target_properties(kimi_k3_kda_batch_check PROPERTIES CXX_STANDARD 17)
-+
-     add_executable(kimi_k3_tp_width_check examples/kimi_k3_tp_width_check.cpp)
-     target_link_libraries(kimi_k3_tp_width_check PRIVATE sparkinfer_runtime CUDA::cudart)
-     set_target_properties(kimi_k3_tp_width_check PROPERTIES CXX_STANDARD 17)
---- a/kernels/csrc/cuda/kimi_k3/k3_kernels.cu
-+++ b/kernels/csrc/cuda/kimi_k3/k3_kernels.cu
-@@ -4135,6 +4135,84 @@
-     if (threadIdx.x == 0) y[n] = acc;
- }
- 
-+// TOKEN-BATCHED F16 PROJECTION — proj_f16_kernel with a token axis inside the block.
-+//
-+// WHY IT HAS TO EXIST. The LM head is the one F16 weight in the model and it is
-+// 163840 x 7168 = 2.349 GB. A K-token verify pass that looped proj_f16_kernel would
-+// re-stream all 2.349 GB per position; at the measured 146.8 GB/s that is ~16 ms of
-+// pure weight traffic per extra token, which on its own roughly DOUBLES the marginal
-+// cost of a speculative position and moves the break-even acceptance from 0.093 to
-+// ~0.19. Every other big projection in the model already has a token-batched form
-+// (k3_proj_q8act_tok_f32); that one is Q8_0-only and the head is not Q8_0.
-+//
-+// The row of W is loaded ONCE per k-chunk and spent on TOKS activations, so the
-+// weight term divides by TOKS. What repeats instead is the activation, 28 KB against
-+// 2.349 GB.
-+//
-+// BIT-IDENTICAL PER OUTPUT ELEMENT, and here is the whole argument. Fix an output
-+// (t, n) and compare with proj_f16_kernel run on token t alone:
-+//   * k-walk. Both start at k = threadIdx.x and stride the SAME way — the 8-way
-+//     unrolled `k += 8*BLOCK` main loop with the same `k + 7*BLOCK < K` bound, then
-+//     the same `k += BLOCK` tail. Thread i owns exactly the same k values in the same
-+//     ascending order.
-+//   * accumulation. Both do `acc += w[u] * v[u]` for u = 0..7 in ascending u, with w
-+//     the same __half2float(row[...]) and v the same x[...]. Same expression, same
-+//     associativity, same order.
-+//   * reduction tree. Both call block_sum<BLOCK> over the same BLOCK threads, which
-+//     does the same shfl_down butterfly and the same ascending fold over warps.
-+// TOKS changes only which output elements share a CUDA block, and it appears in no
-+// accumulation order. That is the same argument proj_q8_0_q8_0_tok_kernel already
-+// leans on for the Q8_0 side.
-+//
-+// block_sum contains __syncthreads(), so EVERY thread calls it for EVERY t and only
-+// the store is guarded — the same rule the multirow kernel above is written to. The
-+// bounds check on the accumulate loops is a separate matter: those contain no
-+// barrier, so skipping an out-of-range token there is ordinary divergence.
-+template <int BLOCK, int TOKS>
-+__global__ void proj_f16_tok_kernel(float* __restrict__ y, int ldy,
-+                                    const float* __restrict__ x, int64_t x_stride,
-+                                    const __half* __restrict__ W, int K, int n_tok) {
-+    k3_pdl_sync();
-+    const int n  = blockIdx.x;
-+    const int t0 = blockIdx.y * TOKS;
-+    const __half* row = W + (size_t)n * K;
-+    __shared__ float shm[BLOCK / 32 + 1];
-+    float acc[TOKS];
-+#pragma unroll
-+    for (int t = 0; t < TOKS; ++t) acc[t] = 0.0f;
-+
-+    int k = threadIdx.x;
-+    for (; k + 7 * BLOCK < K; k += 8 * BLOCK) {
-+        float w[8];
-+#pragma unroll
-+        for (int u = 0; u < 8; ++u) w[u] = __half2float(row[k + u * BLOCK]);
-+#pragma unroll
-+        for (int t = 0; t < TOKS; ++t) {
-+            if (t0 + t >= n_tok) continue;
-+            const float* xt = x + (int64_t)(t0 + t) * x_stride;
-+            float v[8];
-+#pragma unroll
-+            for (int u = 0; u < 8; ++u) v[u] = xt[k + u * BLOCK];
-+#pragma unroll
-+            for (int u = 0; u < 8; ++u) acc[t] += w[u] * v[u];
-+        }
-+    }
-+    for (; k < K; k += BLOCK) {
-+        const float wv = __half2float(row[k]);
-+#pragma unroll
-+        for (int t = 0; t < TOKS; ++t) {
-+            if (t0 + t >= n_tok) continue;
-+            acc[t] += wv * x[(int64_t)(t0 + t) * x_stride + k];
-+        }
-+    }
-+#pragma unroll
-+    for (int t = 0; t < TOKS; ++t) {
-+        const float s = block_sum<BLOCK>(acc[t], shm);
-+        if (threadIdx.x == 0 && t0 + t < n_tok)
-+            y[(size_t)(t0 + t) * (size_t)ldy + n] = s;
-+    }
-+}
-+
- 
- // ROW AXIS (blockIdx.y). ALL THREE operands are row-major activations and all three are
- // offset — this entry point is the residual combine, not a broadcast bias add. A caller
-@@ -6365,6 +6443,64 @@
-     return true;
- }
- 
-+// Token-batched F16 projection: [n_tok, K] activation -> [n_tok, N] logits, one pass
-+// over the weight. The LM head's batched form; see proj_f16_tok_kernel for the
-+// bit-identity argument.
-+//
-+// RETURNS FALSE MEANING "USE THE PER-TOKEN PATH", NEVER "ERROR" — the same contract
-+// every other batched helper in this file keeps. n_tok == 1 declines on its first
-+// line, so a caller that always routes through here gets the exact single-token
-+// launch k3_proj_f32 makes today.
-+bool k3_proj_f16_tok_f32(float* y, int ldy, const float* x, int64_t x_stride,
-+                         const void* W, int wtype, int N, int K, int n_tok,
-+                         cudaStream_t stream) {
-+    if (N <= 0 || K <= 0 || n_tok <= 1) return false;
-+    if (wtype != 1 || !W || !y || !x) return false;
-+    if (ldy < N) return false;
-+    if (x_stride < (int64_t)K) return false;
-+
-+    // BLOCK follows k3_proj_f32's F16 arm exactly, so the per-thread k-walk that the
-+    // bit-identity argument rests on is the same walk. The head is N = 163840, which
-+    // takes the `N > 64` branch to 128 either way; the other tiers are kept so a
-+    // narrow banded head lands where the single-token path would.
-+    const int blk = (N > 64 || K < 1024) ? 128 : (K >= 4096 ? 1024 : 512);
-+
-+    // TOKS is what divides the weight traffic. 8 is as far as the accumulator array
-+    // goes before register pressure costs more occupancy than the extra reuse buys,
-+    // and the grid stays wide regardless because N is enormous for the head.
-+    static const int env_toks = [] {
-+        const char* e = std::getenv("SPARKINFER_K3_HEAD_TOKS");
-+        const int v = e ? std::atoi(e) : 8;
-+        return (v == 0 || v == 2 || v == 4 || v == 8) ? v : 8;
-+    }();
-+    if (env_toks == 0) return false;
-+    const int TOKS = n_tok < env_toks ? (n_tok >= 4 ? 4 : 2) : env_toks;
-+    const int tok_blocks = (n_tok + TOKS - 1) / TOKS;
-+
-+#define K3_HEADTOK_LAUNCH(BLK, T)                                                    \
-+    do {                                                                             \
-+        const dim3 grid((unsigned)N, (unsigned)tok_blocks);                          \
-+        k3_pdl_launch(grid, (BLK), 0, stream, proj_f16_tok_kernel<(BLK), (T)>,       \
-+                      y, ldy, x, x_stride, (const __half*)W, K, n_tok);              \
-+    } while (0)
-+#define K3_HEADTOK_TOKS(BLK)                                                         \
-+    do {                                                                             \
-+        switch (TOKS) {                                                              \
-+            case 8:  K3_HEADTOK_LAUNCH(BLK, 8); break;                               \
-+            case 4:  K3_HEADTOK_LAUNCH(BLK, 4); break;                               \
-+            default: K3_HEADTOK_LAUNCH(BLK, 2); break;                               \
-+        }                                                                            \
-+    } while (0)
-+    switch (blk) {
-+        case 1024: K3_HEADTOK_TOKS(1024); break;
-+        case 512:  K3_HEADTOK_TOKS(512);  break;
-+        default:   K3_HEADTOK_TOKS(128);  break;
-+    }
-+#undef K3_HEADTOK_TOKS
-+#undef K3_HEADTOK_LAUNCH
-+    return true;
-+}
-+
- // Quantise n_tok CONTIGUOUS [K] activations in one launch.
- //
- // VERIFIED against both shapes in k3_proj_q8_fast.cu. quantize_q8_0_warp_kernel derives
---- a/kernels/include/sparkinfer/kernels/kimi_k3.h
-+++ b/kernels/include/sparkinfer/kernels/kimi_k3.h
-@@ -1064,6 +1064,27 @@
-                            const void* W, int wtype, int N, int K, int n_tok,
-                            cudaStream_t stream);
- 
-+// TOKEN-BATCHED F16 PROJECTION — the LM head's batched form, and the only reason it
-+// is separate from the Q8_0 one above is that the head is the model's single F16
-+// weight and that helper is Q8_0-only.
-+//
-+// [n_tok, K] activation (rows x_stride apart) -> [n_tok, N] output (rows ldy apart),
-+// reading the 2.349 GB head ONCE for the whole batch instead of once per position.
-+// Looping the single-token k3_proj_f32 instead costs ~16 ms per extra position at the
-+// measured 146.8 GB/s, which roughly doubles the marginal cost of a speculative token.
-+//
-+// BIT-IDENTICAL per output element to n_tok separate k3_proj_f32 calls: same k-walk
-+// (the same 8-way unrolled `k += 8*BLOCK` main loop and `k += BLOCK` tail from the
-+// same starting threadIdx.x), same `acc += w[u]*v[u]` order, same block_sum tree.
-+// n_tok only decides which outputs share a CUDA block.
-+//
-+// SPARKINFER_K3_HEAD_TOKS sets the token tile (2/4/8, default 8); =0 declines so the
-+// caller falls back to the per-token loop on the same binary. Returns false meaning
-+// "use the per-token path" for n_tok == 1, a non-F16 weight, or under-sized strides.
-+bool k3_proj_f16_tok_f32(float* y, int ldy, const float* x, int64_t x_stride,
-+                         const void* W, int wtype, int N, int K, int n_tok,
-+                         cudaStream_t stream);
-+
- bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
-                       int N, int K, void* q8_scratch, cudaStream_t stream);
- 
+-- 
+2.52.0.windows.1
+

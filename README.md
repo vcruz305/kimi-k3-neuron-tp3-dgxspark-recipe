@@ -19,18 +19,19 @@ Serves the 330 GB Kimi-K3 Neuron IQ1_S GGUF across 3 or 4 NVIDIA DGX Spark (GB10
 > "mechanism fixed, coherent, closely matches a reference at short range" — not "verified
 > byte-identical to any reference implementation."
 >
-> **The speed numbers below predate this fix** and were measured on an engine skipping
-> real computation — they do not apply to the corrected engine. A full kernel-flag sweep
-> on the corrected engine found `SPARKINFER_K3_KDA_FUSE=0` as the best single tuning win
-> (+20%, see [`docs/TP3-KERNEL-FLAG-SWEEP.md`](docs/TP3-KERNEL-FLAG-SWEEP.md)); a proper
-> multi-prompt-median re-measurement of the corrected baseline is still pending — treat
-> the table below as stale until that lands.
+> **Historical pre-fix speed tables are invalid** because they were measured on an engine
+> skipping real computation. They are retained only in the detailed historical documents
+> and must not be cited as current results. The corrected engine now has a bracketed,
+> three-workload measurement: **8.5447 tok/s mean** for confidence-gated K=4 speculative
+> decoding plus distributed head banding, **+40.61%** over its average bracketing baseline.
+> A repeated multi-prompt-median headline is still pending; see [Speed](#speed) for the
+> exact scope and caveats of the current measurement.
 
 | | |
 |---|---|
 | **This recipe** | [`github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe`](https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe) |
 | **Model (GGUF)** | [`huggingface.co/vcruz305/Kimi-K3-Neuron-IQ1S-GGUF`](https://huggingface.co/vcruz305/Kimi-K3-Neuron-IQ1S-GGUF) (~330 GB) |
-| Patches | `0001`–`0020` verified applying/building from a fresh clone; `0021`–`0024` (speculative decoding) are measured on the fleet but **not currently reproducible from a fresh clone** — see [`APPLY.md`](APPLY.md#series-status--what-actually-applies) |
+| Patches | Complete 27-patch chain through `0025` verified via fresh-clone `git am`, fleet build, equivalence tests, benchmark, and serve integration — see [`APPLY.md`](APPLY.md#series-status--what-actually-applies) |
 | Full data | benchmarks, geometry, run steps, non-claims → [`DETAILS.md`](DETAILS.md) |
 
 ## Why SparkInfer
@@ -48,21 +49,22 @@ in [`DETAILS.md`](DETAILS.md#related-vllm-path).
 
 ## Speed
 
-**⚠️ No current, valid headline decode number.** The pre-fix table this section used to
-show (6.84 / 7.945 tok/s) was measured on an engine that skipped real computation (see
-the correctness banner above) and has been removed rather than left in a table someone
-might screenshot out of context. What's real and current instead:
+**Current corrected-engine measurements are available; a repeated-median headline is
+still pending.** The old 6.84 / 7.945 tok/s table was measured on an engine that skipped
+real computation and must not be cited. What is valid now:
 
 - Load time: **~5m45s/rank** (was ~30-60 min pre-patch 0013) — this number is unaffected
   by the correctness fix and still valid.
 - Best single kernel-tuning win on the corrected engine: `SPARKINFER_K3_KDA_FUSE=0`,
   **+20%** over its own (not-yet-headline) baseline — see
   [`docs/TP3-KERNEL-FLAG-SWEEP.md`](docs/TP3-KERNEL-FLAG-SWEEP.md).
-- With speculative decoding (`--spec-draft 4`): **+34.5% mean**, but workload-dependent
-  — see the [Speculative decoding](#speculative-decoding-experimental-opt-in) section
-  below for the real, per-workload numbers.
-- A proper multi-prompt-median baseline on the corrected engine (the rigorous
-  measurement protocol this repo otherwise uses for headline numbers) is still pending.
+- Current measured candidate (confidence-gated K=4 speculative decoding + distributed head
+  banding): **8.5447 tok/s mean, +40.61%** over the average of bracketing corrected
+  baselines. Prose is now +8.07% rather than regressing. See
+  [Speculative decoding](#speculative-decoding-experimental-opt-in).
+- This is a five-run, three-workload, same-session bracketed comparison, not the repo's
+  older repeated multi-prompt-median headline protocol. That stricter headline remains
+  pending; do not relabel 8.5447 as a fleet-wide median.
 
 Full benchmark tables, decode profile, NCCL fabric receipt, and forecast (**historical,
 pre-fix, clearly marked as such**): [`DETAILS.md`](DETAILS.md#benchmarks-measured-on-real-sparks).
@@ -70,7 +72,7 @@ pre-fix, clearly marked as such**): [`DETAILS.md`](DETAILS.md#benchmarks-measure
 ## Quick start
 
 1. 3 or 4 Sparks, local NVMe (≥320 GB free/node), HF access to the gated model.
-2. Pull the model + apply patches 0001–0013 — see [`APPLY.md`](APPLY.md).
+2. Pull the model + apply the verified patch chain through 0025 — see [`APPLY.md`](APPLY.md).
 3. Copy the built `dist/` tree to every rank, launch rank 0 with `--listen`, others with `--coord`.
 
 Full step-by-step (model download, build flags, topology, multi-prompt launch): [`DETAILS.md`](DETAILS.md#full-run-steps).
@@ -80,13 +82,14 @@ Full step-by-step (model download, build flags, topology, multi-prompt launch): 
 [`api-server/`](api-server/README.md) wraps `kimi_k3_dist_generate` with a
 `POST /v1/chat/completions` HTTP server (chat-template tokenization, a rank0
 `--serve` mode so the model stays resident between requests, streaming SSE
-support). Adds `patches/sparkinfer/next/0014-tp-serve-mode-for-dynamic-prompt-requests.patch`
-to the chain above. See `api-server/README.md` for build/run steps and known
+support). Serve mode is introduced by patch 0014 and is verified together with the
+complete speculative-decoding chain through 0025. See `api-server/README.md` for build/run steps and known
 limitations (greedy decoding only, one request in flight at a time).
 
 ## Speculative decoding (experimental, opt-in)
 
-Patches `0021`–`0024` add n-gram/prompt-lookup speculative decoding to the distributed
+Patches `0021`–`0025` add n-gram/prompt-lookup speculative decoding, match-confidence
+gating, and distributed LM-head banding to the distributed
 path: rank0 looks for the current token sequence's most recent earlier occurrence in the
 generation history, drafts the tokens that followed it, and verifies the whole draft in
 one batched forward pass instead of one token at a time. No second model, no training —
@@ -101,14 +104,20 @@ just pattern-matching against what's already been generated.
 | freeform prose | 6.16 | 5.93 | **−3.7%** |
 | **mean across all three** | 5.99 | **8.05** | **+34.5%** |
 
-**Read this honestly, not optimistically.** It's a real, verified speedup on code and
-structured/agentic output — the kind of thing this fleet is most likely serving. It is
-**not** a general-purpose win: on freeform prose it's a measured, reproducible
-*regression*, not just "no benefit." The prose loss comes from occasional false-positive
-matches (short, coincidental token overlaps that are common in natural language and rare
-in code) that trigger an expensive batched verify which then gets rejected. **Enable it
-for code/agentic workloads. Leave it off for open-ended prose generation** until that
-failure mode is tuned out (tracked, not yet done).
+That is the original Stage 4 result. Patch 0025 fixes the false-positive-match failure
+mode by requiring recurrence/continuation agreement, and adds bitwise-equivalent
+distributed head banding. A five-run sequence on the merged serve+spec tree measured:
+
+| config | code | repetition | prose | mean | vs avg baseline |
+|---|---:|---:|---:|---:|---:|
+| baseline before | 6.1612 | 5.7251 | 6.1622 | 6.0162 | — |
+| head-band only | 6.4718 | 6.3173 | 6.3888 | 6.3926 | +5.19% |
+| **confidence K=4 + head-band** | **8.1651** | **10.9018** | **6.5672** | **8.5447** | **+40.61%** |
+| baseline after | 6.1477 | 6.1166 | 6.1496 | 6.1379 | — |
+
+The average bracketing baseline is 6.07705 tok/s. Prose is now +8.07% rather than
+regressing. Draft acceptance was 59/64 = 0.9219. Head banding was independently proven
+bitwise-equivalent on 129/129 dumped logit rows.
 
 **Correctness**: verified against the same standard the rest of this engine is held to —
 not necessarily byte-identical to non-speculative decoding (a documented, understood
@@ -121,18 +130,10 @@ throughout. Backed by 1000+ automated correctness checks (see the patch series b
 
 ### Usage
 
-**Known gap, disclosed here rather than left for you to discover:** a clean-room
-apply audit found that `0021`–`0024`, as stored, do not currently `git am` cleanly
-on top of `0020` — they were diffed against a tree missing `0014` and `0016`, and
-two test targets they reference are never registered in `CMakeLists.txt`. The
-results below are real fleet measurements; the patches just need a rebase before
-they'll apply from this repo. See
-[APPLY.md's series status](APPLY.md#series-status--what-actually-applies) for the
-full root cause before you sink time into applying them by hand.
-
-Once rebased, the intended sequence is patches `0021`→`0022`→`0023`→`0024` in
-order on top of `0020` (each depends on the one before it touching the same
-files). Rebuild `kimi_k3_dist_generate` and
+Apply patches `0021`→`0022`→`0023`→`0024`→`0025` in order on top of `0020`
+(each depends on the one before it touching the same files). The complete 27-patch
+chain was verified from the pinned base via plain `git am`, built on GB10, and
+matched the tested fleet tree byte-for-byte. Rebuild `kimi_k3_dist_generate` and
 `libsparkinfer_runtime.so` and redeploy both to every rank (same sha256sum discipline as
 the base recipe — **do not skip verifying the `.so`**, a stale runtime library behind a
 fresh binary fails silently). Patch `0024` bumps the internal rank-to-rank protocol
@@ -140,7 +141,10 @@ version, so **all ranks must run the same patch level** — a mismatched rank fa
 at startup ("unsupported protocol version") rather than silently desyncing.
 
 Add `--spec-draft K` to rank 0's launch command (K in `[2,16]`; `4` is the measured-best
-value — `8` measured *worse* than `4`, don't assume bigger is better):
+value — `8` measured *worse* than `4`, don't assume bigger is better). The current
+measured command also uses `--spec-ngram-min 2 --spec-ngram-max 3
+--spec-min-occur 2 --spec-require-agree` and the environment variable
+`SPARKINFER_K3_DIST_HEAD_BAND=1`:
 
 **`--spec-draft K` is required on every rank, not just rank 0.** The n-gram matching
 decision is rank0-only, but `--spec-draft K` also arms each rank's local state-rollback
@@ -182,8 +186,9 @@ Paste this into an AI coding agent (Claude Code, etc.) with SSH access to your S
 Set up Kimi-K3 Neuron serving across my DGX Spark fleet using this recipe:
 https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe
 
-1. Read APPLY.md in that repo and apply patches 0001-0013 on top of the pinned
-   gittensor-ai-lab/sparkinfer-k3 base commit, then build kimi_k3_dist_generate.
+1. Read APPLY.md in that repo and apply its complete verified 27-patch chain through
+   0025 on top of the pinned gittensor-ai-lab/sparkinfer-k3 base commit. Use the exact
+   listed order, then build kimi_k3_dist_generate and the documented runtime libraries.
 2. Read DETAILS.md's "Full run steps" section for the model download command,
    required dist/ files, topology, and launch commands. Follow it exactly —
    don't improvise flags.
@@ -212,16 +217,19 @@ https://github.com/vcruz305/kimi-k3-neuron-tp3-dgxspark-recipe
    design (rank0 --serve mode instead of the static --prompts-file path,
    llama.cpp's own vocab for tokenization) and why the wrapper is shaped the
    way it is. Don't improvise around it.
-2. Apply patch 0014 (patches/sparkinfer/next/0014-tp-serve-mode-for-dynamic-prompt-requests.patch)
-   on top of whatever patch level I already have, rebuild kimi_k3_dist_generate,
-   and redeploy dist/ to every rank (same sha256sum discipline as the base recipe).
+2. Follow APPLY.md's complete chain through 0025. Patch 0014 introduces serve mode and
+   is already included; do not apply it twice if the full chain is present. Rebuild
+   kimi_k3_dist_generate and the runtime libraries, then redeploy the same verified
+   dist/ contents to every rank.
 3. Get the model's native HF tokenizer directory (tokenization_kimi.py +
    tiktoken.model + tokenizer_config.json + generation_config.json — NOT a
    llama.cpp rebuild, the wrapper tokenizes in-process via `transformers`).
    Exact fetch steps and why this beats a llama.cpp-based tokenizer in
    api-server/README.md section "Tokenization".
-4. Relaunch rank 0 with --serve 127.0.0.1:29600 instead of --prompts-file
-   (ranks 1..N-1 unchanged). Confirm the "serve mode listening on ..." log line.
+4. Relaunch rank 0 with --serve 127.0.0.1:29600 instead of --prompts-file. Keep every
+   worker at the identical protocol/patch level; if speculative decoding is enabled,
+   pass the same --spec-draft K to every rank. Confirm the "serve mode listening on ..."
+   log line.
 5. Set up the Python venv (api-server/requirements.txt) and start
    api-server/server.py with K3_TOKENIZER_DIR / K3_CHAT_TEMPLATE /
    K3_SERVE_HOST / K3_SERVE_PORT pointed at what you set up in steps 3-4.

@@ -1,322 +1,41 @@
---- a/runtime/include/sparkinfer/tp/rank_protocol.h
-+++ b/runtime/include/sparkinfer/tp/rank_protocol.h
-@@ -19,11 +19,21 @@
- namespace tp {
- namespace dist {
+From 74b2391433397796145c80754dfdd0f879769b2a Mon Sep 17 00:00:00 2001
+From: Victor <victor@local>
+Date: Tue, 11 Aug 2026 22:37:35 -0700
+Subject: [PATCH] tp: 0024 n-gram drafter and rank protocol v2
+
+---
+ runtime/CMakeLists.txt                        |   6 +
+ runtime/examples/kimi_k3_dist_generate.cpp    | 334 +++++++++-
+ runtime/examples/kimi_k3_spec_draft_check.cpp | 573 ++++++++++++++++++
+ .../sparkinfer/models/kimi_k3_ngram_draft.h   |  91 +++
+ runtime/include/sparkinfer/tp/rank_protocol.h |  47 +-
+ .../include/sparkinfer/tp/rank_transport.h    |  12 +-
+ runtime/src/tp/rank_protocol.cpp              |  94 ++-
+ runtime/src/tp/rank_transport_tcp.cpp         |  16 +-
+ runtime/tests/tp3_rank_protocol_cpu_test.cpp  |  24 +-
+ 9 files changed, 1157 insertions(+), 40 deletions(-)
+ create mode 100644 runtime/examples/kimi_k3_spec_draft_check.cpp
+ create mode 100644 runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 7f30a95..a560851 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -186,6 +186,12 @@ add_executable(kimi_k3_tp_check examples/kimi_k3_tp_check.cpp)
+     target_link_libraries(kimi_k3_kda_batch_check PRIVATE sparkinfer_runtime CUDA::cudart)
+     set_target_properties(kimi_k3_kda_batch_check PROPERTIES CXX_STANDARD 17)
  
--constexpr std::uint16_t kProtocolVersion = 1;
-+// v2 widened the Token frame to carry a whole speculative verify batch plus the
-+// rollback index for the PREVIOUS batch. The version is bumped rather than the frame
-+// extended compatibly on purpose: a rank still running a v1 binary must reject the
-+// frame loudly at decode instead of parsing the first token id and silently running a
-+// 1-token step while its peers run a K-token one. Deploying a stale worker is a
-+// failure mode this tree has already been bitten by once.
-+constexpr std::uint16_t kProtocolVersion = 2;
- constexpr int kK3Tp3WorldSize = 3;
- constexpr int kK3Tp4WorldSize = 4;
- constexpr int kNcclUniqueIdBytes = 128;
- 
-+// Ceiling on one step's token count (1 verified + up to kMaxStepTokens-1 drafted).
-+// Bounds the wire frame so a malformed count cannot drive an unbounded allocation.
-+constexpr int kMaxStepTokens = 16;
++    # Stage 4 host-side gates: drafter, accept rule, loop algebra, K-token protocol.
++    # No CUDA, no model, no fleet — runs anywhere the runtime library builds.
++    add_executable(kimi_k3_spec_draft_check examples/kimi_k3_spec_draft_check.cpp)
++    target_link_libraries(kimi_k3_spec_draft_check PRIVATE sparkinfer_runtime CUDA::cudart)
++    set_target_properties(kimi_k3_spec_draft_check PROPERTIES CXX_STANDARD 17)
 +
- // Supported multi-Spark world sizes for the Neuron release geometry.
- inline bool supported_k3_dist_world_size(int world_size) {
-     return world_size == kK3Tp3WorldSize || world_size == kK3Tp4WorldSize;
-@@ -31,8 +41,10 @@
- constexpr std::size_t kDigestBytes = 32;
- constexpr std::size_t kMaxDetailBytes = 256;
- constexpr std::size_t kWireHeaderBytes = 16;
--constexpr std::size_t kWireFixedPayloadBytes = 250;
--constexpr std::size_t kMaxPayloadBytes = kWireFixedPayloadBytes + kMaxDetailBytes;
-+// 250 in v1; +4 for rollback_j and +4 for the n_token_ids/reserved2 u16 pair.
-+constexpr std::size_t kWireFixedPayloadBytes = 258;
-+constexpr std::size_t kMaxPayloadBytes =
-+    kWireFixedPayloadBytes + kMaxDetailBytes + (std::size_t)kMaxStepTokens * 4;
- constexpr std::size_t kMaxFrameBytes = kWireHeaderBytes + kMaxPayloadBytes;
- 
- using Digest = std::array<std::uint8_t, kDigestBytes>;
-@@ -96,11 +108,22 @@
-     int vocab = 0;
-     int token_id = -1;
-     int status = 0;
-+    // Roll the recurrent state back to "having consumed exactly rollback_j+1 tokens of
-+    // the PREVIOUS step's batch", applied before this step's own tokens. -1 = nothing to
-+    // roll back. Carried on the next Token rather than sent as its own message so a
-+    // speculative step still costs exactly one control round trip and the "no later
-+    // sequence before StepDone" gate stays exactly as strict as it was.
-+    int rollback_j = -1;
-     Phase phase = Phase::None;
-     Digest model_digest{};
-     Digest plan_digest{};
-     NcclUniqueId nccl_id{};
-     std::string detail;
-+    // Token frames only. Empty = ordinary single-token step described by token_id.
-+    // Non-empty = the K tokens of a speculative verify batch, in recurrence order, with
-+    // token_ids[0] == token_id so a reader that only understands the scalar still sees a
-+    // consistent leading token.
-+    std::vector<int> token_ids;
- };
- 
- // Out-of-band identity supplied by the transport after it has authenticated or
-@@ -161,6 +184,14 @@
-     bool begin_step(int token_id, std::vector<Message>* outbound,
-                     std::string* error = nullptr);
- 
-+    // Broadcast a whole speculative verify batch as ONE step: n_tok tokens in recurrence
-+    // order, preceded on each rank by a rollback to prev_rollback_j of the previous
-+    // batch (-1 = none). Still one Token message per rank per sequence, so the sequence
-+    // gate is untouched. The KV-reset sentinel is not admissible inside a batch — it is
-+    // a whole-step operation and must go through begin_step.
-+    bool begin_step_multi(const int* token_ids, int n_tok, int prev_rollback_j,
-+                          std::vector<Message>* outbound, std::string* error = nullptr);
-+
-     // Clean EOS. Finish is sequence-gated and acknowledged by every rank; Finished
-     // is distinct from Failed so a normal generator shutdown is never reported as
-     // an abort.
-@@ -217,8 +248,16 @@
- 
-     // Accept NcclUniqueId, BeginLoad, Token, Finish, or Abort. For Token, token_id
-     // receives the synchronized input. No later sequence is accepted before StepDone.
-+    //
-+    // token_ids and rollback_j receive the speculative batch and the pending rollback
-+    // index when the coordinator sent one. A caller that passes neither still works and
-+    // sees the leading token — but a Token carrying MORE THAN ONE id is REJECTED when
-+    // token_ids is null, because running only the first token of a batch the other ranks
-+    // are running whole would desynchronize the collectives.
-     bool accept_control(const Message& message, int* token_id = nullptr,
--                        std::string* error = nullptr);
-+                        std::string* error = nullptr,
-+                        std::vector<int>* token_ids = nullptr,
-+                        int* rollback_j = nullptr);
- 
-     bool report_nccl_ready(bool success, int status, const std::string& detail,
-                            Message* outbound, std::string* error = nullptr);
---- a/runtime/src/tp/rank_protocol.cpp
-+++ b/runtime/src/tp/rank_protocol.cpp
-@@ -199,6 +199,14 @@
-         set_error(error, "diagnostic detail exceeds protocol bound");
-         return false;
-     }
-+    if (m.token_ids.size() > (std::size_t)kMaxStepTokens) {
-+        set_error(error, "step token count exceeds protocol bound");
-+        return false;
-+    }
-+    if (!m.token_ids.empty() && m.token_ids[0] != m.token_id) {
-+        set_error(error, "token_ids[0] disagrees with token_id");
-+        return false;
-+    }
- 
-     std::vector<std::uint8_t> payload;
-     payload.reserve(kWireFixedPayloadBytes + m.detail.size());
-@@ -213,13 +221,17 @@
-     put_i32(payload, m.vocab);
-     put_i32(payload, m.token_id);
-     put_i32(payload, m.status);
-+    put_i32(payload, m.rollback_j);
-     put_u16(payload, phase);
-     put_u16(payload, 0);  // reserved; must decode as zero
-+    put_u16(payload, static_cast<std::uint16_t>(m.token_ids.size()));
-+    put_u16(payload, 0);  // reserved2; must decode as zero
-     payload.insert(payload.end(), m.model_digest.begin(), m.model_digest.end());
-     payload.insert(payload.end(), m.plan_digest.begin(), m.plan_digest.end());
-     payload.insert(payload.end(), m.nccl_id.begin(), m.nccl_id.end());
-     put_u16(payload, static_cast<std::uint16_t>(m.detail.size()));
-     payload.insert(payload.end(), m.detail.begin(), m.detail.end());
-+    for (int id : m.token_ids) put_i32(payload, id);
- 
-     frame->clear();
-     if (payload.size() < kWireFixedPayloadBytes || payload.size() > kMaxPayloadBytes) {
-@@ -264,13 +276,13 @@
-     Reader r{payload, payload_size, 0};
-     Message m;
-     m.type = static_cast<MessageType>(type);
--    std::uint16_t phase = 0, reserved = 0, detail_size = 0;
-+    std::uint16_t phase = 0, reserved = 0, n_ids = 0, reserved2 = 0, detail_size = 0;
-     if (!r.u64(&m.session_id) || !r.u64(&m.sequence) ||
-         !r.i32(&m.rank) || !r.i32(&m.world_size) || !r.i32(&m.local_device) ||
-         !r.i32(&m.n_experts) || !r.i32(&m.moe_ffn) ||
-         !r.i32(&m.expert_block_elems) || !r.i32(&m.vocab) ||
--        !r.i32(&m.token_id) || !r.i32(&m.status) ||
--        !r.u16(&phase) || !r.u16(&reserved) ||
-+        !r.i32(&m.token_id) || !r.i32(&m.status) || !r.i32(&m.rollback_j) ||
-+        !r.u16(&phase) || !r.u16(&reserved) || !r.u16(&n_ids) || !r.u16(&reserved2) ||
-         !r.bytes(m.model_digest.data(), m.model_digest.size()) ||
-         !r.bytes(m.plan_digest.data(), m.plan_digest.size()) ||
-         !r.bytes(m.nccl_id.data(), m.nccl_id.size()) ||
-@@ -278,13 +290,29 @@
-         set_error(error, "truncated message payload"); return false;
-     }
-     if (!valid_phase(phase)) { set_error(error, "unknown protocol phase"); return false; }
--    if (reserved != 0) { set_error(error, "nonzero reserved field"); return false; }
--    if (detail_size > kMaxDetailBytes || r.at + detail_size != r.size) {
-+    if (reserved != 0 || reserved2 != 0) {
-+        set_error(error, "nonzero reserved field"); return false;
-+    }
-+    if (n_ids > kMaxStepTokens) {
-+        set_error(error, "step token count outside protocol bounds"); return false;
-+    }
-+    if (detail_size > kMaxDetailBytes || r.at + detail_size > r.size) {
-         set_error(error, "invalid diagnostic detail length"); return false;
-     }
-     m.phase = static_cast<Phase>(phase);
-     m.detail.assign(reinterpret_cast<const char*>(r.data + r.at), detail_size);
-     r.at += detail_size;
-+    m.token_ids.resize(n_ids);
-+    for (std::uint16_t i = 0; i < n_ids; ++i) {
-+        if (!r.i32(&m.token_ids[i])) {
-+            set_error(error, "truncated step token vector"); return false;
-+        }
-+    }
-+    // Exact length, as in v1: a frame with trailing bytes is malformed, not tolerated.
-+    if (r.at != r.size) { set_error(error, "trailing bytes after payload"); return false; }
-+    if (n_ids > 0 && m.token_ids[0] != m.token_id) {
-+        set_error(error, "token_ids[0] disagrees with token_id"); return false;
-+    }
-     *message = std::move(m);
-     return true;
- }
-@@ -521,6 +549,43 @@
-     return true;
- }
- 
-+bool Coordinator::begin_step_multi(const int* token_ids, int n_tok, int prev_rollback_j,
-+                                   std::vector<Message>* outbound, std::string* error) {
-+    if (state_ != CoordinatorState::Ready) {
-+        if (state_ == CoordinatorState::Failed) { set_error(error, failure_); return false; }
-+        if (state_ == CoordinatorState::Finished) {
-+            set_error(error, "cluster already finished");
-+            return false;
-+        }
-+        return abort_cluster(Phase::Step, -14, "batch started before cluster Ready",
-+                             outbound, error);
-+    }
-+    if (!outbound) return abort_cluster(Phase::Step, -15,
-+                                        "batch broadcast has no outbound sink", outbound, error);
-+    if (!token_ids || n_tok < 1 || n_tok > kMaxStepTokens)
-+        return abort_cluster(Phase::Step, -23, "batch token count outside protocol bounds",
-+                             outbound, error);
-+    // No -2 sentinel here: a KV reset is a whole-step operation, not a batch member.
-+    for (int b = 0; b < n_tok; ++b)
-+        if (token_ids[b] < 0 || token_ids[b] >= cluster_.vocab)
-+            return abort_cluster(Phase::Step, -16, "batch token id outside vocabulary",
-+                                 outbound, error);
-+    if (prev_rollback_j < -1 || prev_rollback_j >= kMaxStepTokens)
-+        return abort_cluster(Phase::Step, -24, "rollback index outside protocol bounds",
-+                             outbound, error);
-+    std::fill(step_done_.begin(), step_done_.end(), 0);
-+    for (int rank = 0; rank < cluster_.world_size; ++rank) {
-+        Message m = control(MessageType::Token, rank);
-+        m.phase = Phase::Step;
-+        m.token_id = token_ids[0];
-+        m.rollback_j = prev_rollback_j;
-+        m.token_ids.assign(token_ids, token_ids + n_tok);
-+        outbound->push_back(std::move(m));
-+    }
-+    state_ = CoordinatorState::StepInFlight;
-+    return true;
-+}
-+
- bool Coordinator::finish(std::vector<Message>* outbound, std::string* error) {
-     if (state_ != CoordinatorState::Ready) {
-         if (state_ == CoordinatorState::Failed) { set_error(error, failure_); return false; }
-@@ -585,7 +650,8 @@
-     return true;
- }
- 
--bool RankSession::accept_control(const Message& m, int* token_id, std::string* error) {
-+bool RankSession::accept_control(const Message& m, int* token_id, std::string* error,
-+                                 std::vector<int>* token_ids, int* rollback_j) {
-     if (m.session_id != spec_.session_id || m.world_size != spec_.world_size ||
-         m.rank != spec_.rank || m.local_device != spec_.local_device ||
-         m.n_experts != spec_.n_experts || m.moe_ffn != spec_.moe_ffn ||
-@@ -641,7 +707,23 @@
-             if (!(m.token_id == -2) && (m.token_id < 0 || m.token_id >= spec_.vocab))
-                 return reject("Token id outside vocabulary", error);
-             if (!token_id) return reject("Token has no output sink", error);
-+            if (m.token_ids.size() > (std::size_t)kMaxStepTokens)
-+                return reject("Token batch exceeds protocol bound", error);
-+            // Running only the leading token of a batch every other rank runs whole would
-+            // leave this rank issuing a different number of collectives, which hangs NCCL
-+            // rather than failing — refuse it here where the diagnostic is readable.
-+            if (m.token_ids.size() > 1 && !token_ids)
-+                return reject("Token batch has no batch output sink", error);
-+            for (std::size_t b = 0; b < m.token_ids.size(); ++b)
-+                if (m.token_ids[b] < 0 || m.token_ids[b] >= spec_.vocab)
-+                    return reject("Token batch id outside vocabulary", error);
-+            if (m.rollback_j < -1 || m.rollback_j >= kMaxStepTokens)
-+                return reject("Token rollback index outside protocol bounds", error);
-+            if (m.rollback_j >= 0 && !rollback_j)
-+                return reject("Token rollback has no output sink", error);
-             *token_id = m.token_id;
-+            if (token_ids) *token_ids = m.token_ids;
-+            if (rollback_j) *rollback_j = m.rollback_j;
-             state_ = RankState::StepRunning;
-             return true;
- 
---- a/runtime/include/sparkinfer/tp/rank_transport.h
-+++ b/runtime/include/sparkinfer/tp/rank_transport.h
-@@ -138,6 +138,10 @@
-     CoordinatorState state() const;
- 
-     bool begin_step(int token_id, std::string* error = nullptr);
-+    // One speculative verify batch as a single step, preceded on every rank by a
-+    // rollback to prev_rollback_j of the previous batch (-1 = none).
-+    bool begin_step_multi(const int* token_ids, int n_tok, int prev_rollback_j,
-+                          std::string* error = nullptr);
-     bool finish(std::string* error = nullptr);
-     bool fail(const std::string& detail, std::string* error = nullptr);
- 
-@@ -187,7 +191,13 @@
-     // Block until next Token, Finish, or Abort. Returns false on failure/finish.
-     // When true, *token_id is the synchronized input and the caller must run the
-     // local forward then call report_step_done.
--    bool wait_token(int* token_id, std::string* error = nullptr);
-+    //
-+    // token_ids receives the whole speculative batch when one was sent (empty otherwise),
-+    // and rollback_j the index to roll the PREVIOUS batch back to before running this
-+    // step (-1 = none). A caller that passes neither cannot be sent a batch: the session
-+    // rejects a multi-token Token with no sink rather than silently running token 0.
-+    bool wait_token(int* token_id, std::string* error = nullptr,
-+                    std::vector<int>* token_ids = nullptr, int* rollback_j = nullptr);
-     bool report_step_done(bool success, int status, const std::string& detail,
-                           std::string* error = nullptr);
-     bool wait_finished(std::string* error = nullptr);
---- a/runtime/src/tp/rank_transport_tcp.cpp
-+++ b/runtime/src/tp/rank_transport_tcp.cpp
-@@ -714,6 +714,15 @@
-     return dispatch_outbound(outbound, error);
- }
- 
-+bool CoordinatorTransport::begin_step_multi(const int* token_ids, int n_tok,
-+                                            int prev_rollback_j, std::string* error) {
-+    std::lock_guard<std::mutex> lock(mu_);
-+    std::vector<Message> outbound;
-+    if (!coord_.begin_step_multi(token_ids, n_tok, prev_rollback_j, &outbound, error))
-+        return false;
-+    return dispatch_outbound(outbound, error);
-+}
-+
- bool CoordinatorTransport::finish(std::string* error) {
-     // Do NOT hold mu_ across the wait — rx_loop needs mu_ to accept worker FinishAcks.
-     {
-@@ -924,11 +933,14 @@
-     return session_.state() == RankState::WaitingToken;
- }
- 
--bool RankTransport::wait_token(int* token_id, std::string* error) {
-+bool RankTransport::wait_token(int* token_id, std::string* error,
-+                               std::vector<int>* token_ids, int* rollback_j) {
-     Message m;
-+    if (token_ids) token_ids->clear();
-+    if (rollback_j) *rollback_j = -1;
-     if (!recv(&m, error)) return false;
-     int tok = -1;
--    if (!session_.accept_control(m, &tok, error)) return false;
-+    if (!session_.accept_control(m, &tok, error, token_ids, rollback_j)) return false;
-     if (m.type == MessageType::Finish || m.type == MessageType::Abort) {
-         return false;
-     }
+     add_executable(kimi_k3_tp_width_check examples/kimi_k3_tp_width_check.cpp)
+     target_link_libraries(kimi_k3_tp_width_check PRIVATE sparkinfer_runtime CUDA::cudart)
+     set_target_properties(kimi_k3_tp_width_check PROPERTIES CXX_STANDARD 17)
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+index 56234a4..48a8a0b 100644
 --- a/runtime/examples/kimi_k3_dist_generate.cpp
 +++ b/runtime/examples/kimi_k3_dist_generate.cpp
 @@ -15,6 +15,7 @@
@@ -327,7 +46,7 @@
  #include "sparkinfer/tp/rank_protocol.h"
  #include "sparkinfer/tp/rank_transport.h"
  
-@@ -54,10 +55,15 @@
+@@ -63,10 +64,15 @@ void usage(const char* argv0) {
                   "          [--session-id N] [--dry-protocol]\n"
                   "          [--spec-bench K]     # batched-verify fidelity + step(K) cost\n"
                   "          [--spec-rollback K] [--spec-cont N]   # Stage 3 rollback gates\n"
@@ -336,15 +55,14 @@
                   "\n"
                   "  KV reset sentinel token id = -2 (broadcast between multi-prompts).\n"
                   "  --spec-bench and --spec-rollback exchange no control messages, so\n"
--                 "  EVERY rank must be given the SAME flag and the SAME --prompt-ids.\n",
-+                 "  EVERY rank must be given the SAME flag and the SAME --prompt-ids.\n"
+                  "  EVERY rank must be given the SAME flag and the SAME --prompt-ids.\n"
 +                 "  --spec-draft DOES use the control plane (rank0 picks drafts from its\n"
 +                 "  own history), but every rank still needs the flag so workers arm the\n"
-+                 "  rollback ring and accept K-token steps. Needs PREFILL_CHUNK >= K.\n",
-                  argv0);
- }
- 
-@@ -448,6 +454,8 @@
++                 "  rollback ring and accept K-token steps. Needs PREFILL_CHUNK >= K.\n"
+                  "\n"
+                  "  --serve keeps rank0 resident after load and accepts requests on a local\n"
+                  "  control port instead of reading --prompts-file. One line per request,\n"
+@@ -682,6 +688,8 @@ int main(int argc, char** argv) {
      int spec_bench = 0;   // --spec-bench K: batched-verify correctness + step(K) timing
      int spec_rollback = 0;   // --spec-rollback K: Stage 3 state-rollback gates
      int spec_cont = 3;       // --spec-cont N: continuation steps the rollback check runs
@@ -353,7 +71,7 @@
  
      for (int i = 1; i < argc; ++i) {
          auto need = [&](const char* flag) -> const char* {
-@@ -477,6 +485,11 @@
+@@ -712,6 +720,11 @@ int main(int argc, char** argv) {
          else if (!std::strcmp(argv[i], "--spec-rollback"))
              spec_rollback = std::atoi(need("--spec-rollback"));
          else if (!std::strcmp(argv[i], "--spec-cont")) spec_cont = std::atoi(need("--spec-cont"));
@@ -365,7 +83,7 @@
          else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
              usage(argv[0]);
              return 0;
-@@ -503,6 +516,29 @@
+@@ -738,6 +751,30 @@ int main(int argc, char** argv) {
          std::fprintf(stderr, "workers require --coord HOST:PORT\n");
          return 2;
      }
@@ -392,10 +110,11 @@
 +            return 2;
 +        }
 +    }
- 
-     RankSpec spec;
-     spec.session_id = session_id ? session_id : 1;
-@@ -653,6 +689,22 @@
++
+     std::string serve_host;
+     uint16_t serve_port = 0;
+     if (!serve_addr.empty()) {
+@@ -900,6 +937,22 @@ int main(int argc, char** argv) {
  
          std::vector<float> logits((size_t)dist.cfg.vocab);
  
@@ -418,7 +137,7 @@
          auto one_step = [&](int tok, float* logits_out) -> bool {
              {
                  char buf[96];
-@@ -709,6 +761,49 @@
+@@ -956,6 +1009,49 @@ int main(int argc, char** argv) {
              return true;
          };
  
@@ -465,14 +184,126 @@
 +            return true;
 +        };
 +
+         // Serve mode: accept dynamic requests on a local control port instead of a
+         // fixed --prompts-file list, after the model is already resident. Reuses
+         // the exact same one_step()/KV-reset machinery as multi-prompt mode above --
+@@ -1022,14 +1118,12 @@ int main(int argc, char** argv) {
+                 std::string stop_reason = "length";
+                 bool client_gone = false;
+                 const auto t_gen0 = clock::now();
+-                for (int n = 0; n < req.n_predict; ++n) {
+-                    apply_decode_guard(logits.data(), dist.cfg.vocab, generated);
+-                    const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
+-                    if (req.stop_ids.count(next)) {
++                auto emit_token = [&](int tok) -> bool {
++                    if (req.stop_ids.count(tok)) {
+                         stop_reason = "stop";
+-                        break;
++                        return false;
+                     }
+-                    generated.push_back(next);
++                    generated.push_back(tok);
+                     // Streaming: push each token id as it is sampled, so the API
+                     // wrapper can forward it before the whole reply is done. "tok="
+                     // progress lines precede the single terminating "ok=..."/
+@@ -1038,11 +1132,79 @@ int main(int argc, char** argv) {
+                     // stays synchronized for the next request; we just stop trying
+                     // to write to a socket nobody is reading from any more.
+                     if (req.stream && !client_gone) {
+-                        client_gone = !conn.write_line("tok=" + std::to_string(next));
++                        client_gone = !conn.write_line("tok=" + std::to_string(tok));
+                     }
+-                    if (!one_step(next, logits.data())) {
+-                        if (!client_gone) conn.write_line(format_serve_err("decode failed"));
+-                        return 1;
++                    return true;
++                };
++
++                if (spec_draft > 0 && req.n_predict > 0) {
++                    // The repetition guard remains on the ordinary decode path only.
++                    // Patch 0019 fixed the collapse it originally treated, while applying
++                    // the guard here would rewrite the literal repetition pattern that
++                    // prompt-lookup is specifically designed to accelerate.
++                    std::vector<int> ctx = req.prompt_ids;
++                    int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
++                    bool keep_going = emit_token(next);
++                    if (keep_going) ctx.push_back(next);
++
++                    int pending_rb = -1;
++                    std::vector<int> draft, batch;
++                    while (keep_going && (int)generated.size() < req.n_predict) {
++                        const int budget = req.n_predict - (int)generated.size();
++                        int max_draft = spec_draft - 1;
++                        if (max_draft > budget - 1) max_draft = budget - 1;
++
++                        draft.clear();
++                        const int d = max_draft > 0
++                            ? kimi_k3_ngram_draft(ctx, max_draft, ngram_cfg, &draft)
++                            : 0;
++                        batch.assign((size_t)1, next);
++                        for (int i = 0; i < d; ++i) batch.push_back(draft[(size_t)i]);
++                        if (!spec_step(batch.data(), (int)batch.size(), pending_rb,
++                                       batch_logits.data())) {
++                            if (!client_gone) conn.write_line(format_serve_err("decode failed"));
++                            return 1;
++                        }
++
++                        int bonus = -1;
++                        const int j = kimi_k3_spec_accept_prefix(
++                            draft.data(), d,
++                            [&](int row) {
++                                return kimi_k3_dist_argmax(
++                                    batch_logits.data() +
++                                        (size_t)row * (size_t)dist.cfg.vocab,
++                                    dist.cfg.vocab);
++                            },
++                            &bonus);
++
++                        for (int i = 0; i < d && i <= j; ++i) {
++                            ++spec_drafted_at[(size_t)i];
++                            if (i < j) ++spec_accepted_at[(size_t)i];
++                        }
++                        for (int i = 0; i < j && keep_going; ++i) {
++                            keep_going = emit_token(draft[(size_t)i]);
++                            if (keep_going) ctx.push_back(draft[(size_t)i]);
++                        }
++                        if (keep_going && (int)generated.size() < req.n_predict) {
++                            keep_going = emit_token(bonus);
++                            if (keep_going) ctx.push_back(bonus);
++                        }
++                        next = bonus;
++                        pending_rb = ((int)batch.size() > 1) ? j : -1;
++                        ++spec_steps;
++                        if (d > 0) ++spec_draft_steps;
++                        spec_sum_d += d;
++                        spec_sum_j += j;
++                    }
++                } else {
++                    for (int n = 0; n < req.n_predict; ++n) {
++                        apply_decode_guard(logits.data(), dist.cfg.vocab, generated);
++                        const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
++                        if (!emit_token(next)) break;
++                        if (!one_step(next, logits.data())) {
++                            if (!client_gone) conn.write_line(format_serve_err("decode failed"));
++                            return 1;
++                        }
+                     }
+                 }
+                 const double decode_s = std::chrono::duration<double>(clock::now() - t_gen0).count();
+@@ -1068,7 +1230,6 @@ int main(int argc, char** argv) {
+             kimi_k3_dist_rank_free(&dist);
+             return 0;
+         }
+-
          using clock = std::chrono::steady_clock;
          double sum_decode_tps = 0.0;
          int n_ok = 0;
-@@ -746,21 +841,101 @@
+@@ -1106,22 +1267,102 @@ int main(int argc, char** argv) {
  
              std::vector<int> generated;
              const auto t_gen0 = clock::now();
 -            for (int n = 0; n < n_predict; ++n) {
+-                apply_decode_guard(logits.data(), dist.cfg.vocab, generated);
 -                const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
 +            if (spec_draft > 0) {
 +                // ctx is everything the model has consumed PLUS the one token about to be
@@ -559,6 +390,7 @@
 +                }
 +            } else {
 +                for (int n = 0; n < n_predict; ++n) {
++                    apply_decode_guard(logits.data(), dist.cfg.vocab, generated);
 +                    const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
 +                    generated.push_back(next);
 +                    std::printf(" gen[%d]=%d\n", n, next);
@@ -580,7 +412,7 @@
              sum_decode_tps += decode_tps;
              ++n_ok;
              std::printf("OK generated %zu tokens in %.3fs (decode_tok_s=%.4f) prompt=%zu\n",
-@@ -778,6 +953,30 @@
+@@ -1139,6 +1380,30 @@ int main(int argc, char** argv) {
              std::fflush(stderr);
          }
  
@@ -611,7 +443,7 @@
          if (n_ok > 0) {
              std::printf("OK multi-prompt summary prompts=%d mean_decode_tok_s=%.4f\n", n_ok,
                          sum_decode_tps / (double)n_ok);
-@@ -851,14 +1050,21 @@
+@@ -1212,14 +1477,21 @@ int main(int argc, char** argv) {
          return rc;
      }
  
@@ -634,7 +466,7 @@
              if (wtr.state() == RankState::Finished || wtr.state() == RankState::FinishPending) {
                  wtr.wait_finished(nullptr);
                  std::printf("[rank %d] finished\n", rank);
-@@ -875,6 +1081,15 @@
+@@ -1236,6 +1508,15 @@ int main(int argc, char** argv) {
              std::snprintf(buf, sizeof(buf), "rank%d wait_token got tok=%d; forward enter", rank, tok);
              gen_trace(buf);
          }
@@ -650,7 +482,7 @@
          if (tok == kKvResetSentinel) {
              gen_trace("worker KV reset sentinel");
              kimi_k3_reset_state(dist.state);
-@@ -889,7 +1104,12 @@
+@@ -1250,7 +1531,12 @@ int main(int argc, char** argv) {
              }
              continue;
          }
@@ -664,169 +496,9 @@
              wtr.report_step_done(false, 1, err, nullptr);
              std::fprintf(stderr, "forward: %s\n", err.c_str());
              std::fflush(stderr);
---- a/runtime/tests/tp3_rank_protocol_cpu_test.cpp
-+++ b/runtime/tests/tp3_rank_protocol_cpu_test.cpp
-@@ -56,7 +56,8 @@
-            a.expert_block_elems == b.expert_block_elems && a.vocab == b.vocab &&
-            a.token_id == b.token_id && a.status == b.status && a.phase == b.phase &&
-            a.model_digest == b.model_digest && a.plan_digest == b.plan_digest &&
--           a.nccl_id == b.nccl_id && a.detail == b.detail;
-+           a.nccl_id == b.nccl_id && a.detail == b.detail &&
-+           a.rollback_j == b.rollback_j && a.token_ids == b.token_ids;
- }
- 
- static Message wire(const Message& in) {
-@@ -187,10 +188,17 @@
-               error.find("magic") != std::string::npos,
-           "bad magic must fail");
-     corrupt = bytes;
--    corrupt[4] = 2; corrupt[5] = 0;
-+    // Any version other than the current one, including the PREVIOUS one: a rank running
-+    // a v1 binary must reject a v2 Token rather than parse its scalar token_id and run a
-+    // 1-token step while its peers run the whole batch.
-+    corrupt[4] = 1; corrupt[5] = 0;
-     CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
-               error.find("version") != std::string::npos,
--          "bad version must fail");
-+          "superseded version must fail");
-+    corrupt[4] = (std::uint8_t)(kProtocolVersion + 1); corrupt[5] = 0;
-+    CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
-+              error.find("version") != std::string::npos,
-+          "future version must fail");
-     corrupt = bytes;
-     corrupt[6] = 99; corrupt[7] = 0;
-     CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
-@@ -211,7 +219,17 @@
-           "oversized detail must fail");
-     hello.detail.assign(kMaxDetailBytes, 'x');
-     CHECK(encode_message(hello, &bytes, &error), "maximum-size frame must encode");
-+    // v2 added a variable token-id tail, so the largest frame a transport must be sized
-+    // for is max detail AND a full speculative batch, not max detail alone.
-+    CHECK_EQ(bytes.size(), kWireHeaderBytes + kWireFixedPayloadBytes + kMaxDetailBytes);
-+    hello.token_id = 5;
-+    hello.token_ids.assign(kMaxStepTokens, 5);
-+    CHECK(encode_message(hello, &bytes, &error), "maximum batch frame must encode");
-     CHECK_EQ(bytes.size(), kMaxFrameBytes);
-+    CHECK(same_message(hello, wire(hello)), "maximum batch frame must round-trip");
-+    hello.token_ids.assign(kMaxStepTokens + 1, 5);
-+    CHECK(!encode_message(hello, &bytes, &error) && error.find("bound") != std::string::npos,
-+          "oversized batch must fail: %s", error.c_str());
- }
- 
- static void test_full_bootstrap_load_and_two_steps() {
---- a/runtime/CMakeLists.txt
-+++ b/runtime/CMakeLists.txt
-@@ -186,6 +186,12 @@
-     target_link_libraries(kimi_k3_kda_batch_check PRIVATE sparkinfer_runtime CUDA::cudart)
-     set_target_properties(kimi_k3_kda_batch_check PROPERTIES CXX_STANDARD 17)
- 
-+    # Stage 4 host-side gates: drafter, accept rule, loop algebra, K-token protocol.
-+    # No CUDA, no model, no fleet — runs anywhere the runtime library builds.
-+    add_executable(kimi_k3_spec_draft_check examples/kimi_k3_spec_draft_check.cpp)
-+    target_link_libraries(kimi_k3_spec_draft_check PRIVATE sparkinfer_runtime CUDA::cudart)
-+    set_target_properties(kimi_k3_spec_draft_check PROPERTIES CXX_STANDARD 17)
-+
-     add_executable(kimi_k3_tp_width_check examples/kimi_k3_tp_width_check.cpp)
-     target_link_libraries(kimi_k3_tp_width_check PRIVATE sparkinfer_runtime CUDA::cudart)
-     set_target_properties(kimi_k3_tp_width_check PROPERTIES CXX_STANDARD 17)
-diff --git a/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h b/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h
-new file mode 100644
---- /dev/null
-+++ b/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h
-@@ -0,0 +1,91 @@
-+#pragma once
-+// Prompt-lookup (n-gram self-speculation) drafter — pure host logic, no GPU, no NCCL.
-+//
-+// At each decode step the caller asks: given everything generated so far, what tokens
-+// are likely to come next? This answers by finding where the current tail last occurred
-+// earlier in the same sequence and proposing whatever followed it that time. It is the
-+// whole drafting strategy for K3 speculative decoding, chosen because the model occupies
-+// ~110 GB of each Spark's 121 GB and leaves no room for draft weights, and because a
-+// drafter that costs nothing when it declines to draft is nearly free to attempt against
-+// a break-even acceptance of ~0.13.
-+//
-+// Cost is a backward memcmp scan over a few thousand ints — microseconds, off the GPU and
-+// off the critical path. Header-only so the decode loop and its test share one definition
-+// rather than two that can drift.
-+
-+#include <cstddef>
-+#include <cstring>
-+#include <vector>
-+
-+namespace sparkinfer {
-+
-+struct K3NgramDraftConfig {
-+    // Longest tail matched first. Longer matches are rarer but far likelier to continue
-+    // correctly, so the scan is strictly best-first: the first n that hits wins.
-+    int n_max = 3;
-+    // Shortest tail the drafter will accept a match on. Measured on TP3, 3 workloads,
-+    // 64 tokens each, against a two-run baseline: n_min = 1 fires on almost every step
-+    // because some single token always recurs, and those matches are mostly junk — it
-+    // cost freeform prose 12.5% (a K-wide pass bought ~1 token) while buying only 8% more
-+    // on code than n_min = 2 does. n_min = 3 is too shy: it drafts on 16% of steps and
-+    // gives back most of the win. 2 is the measured optimum, not a guess.
-+    int n_min = 2;
-+};
-+
-+// Propose up to max_draft continuation tokens for ctx, appending them to *out.
-+// Returns the number proposed; 0 means "no match, take the ordinary single-token path".
-+//
-+// ctx must be the FULL token history the model has consumed plus the one token the
-+// caller is about to feed — the drafter predicts what follows that token, so leaving it
-+// out shifts every proposal one position early.
-+inline int kimi_k3_ngram_draft(const std::vector<int>& ctx, int max_draft,
-+                               const K3NgramDraftConfig& cfg, std::vector<int>* out) {
-+    if (!out || max_draft <= 0 || ctx.empty()) return 0;
-+    const long long len = (long long)ctx.size();
-+    const int n_hi = cfg.n_max < (int)len ? cfg.n_max : (int)len;
-+    const int n_lo = cfg.n_min < 1 ? 1 : cfg.n_min;
-+
-+    for (int n = n_hi; n >= n_lo; --n) {
-+        const int* pat = ctx.data() + (len - n);
-+        // Backward from the latest possible start, so the FIRST hit is the most recent
-+        // occurrence. Recency matters: in structured output the nearest repetition is the
-+        // one still in the model's active pattern, and an older one is likely a different
-+        // block that merely shares a prefix. Start at len-n-1 so the tail cannot match
-+        // itself and so at least one token follows the match.
-+        for (long long s = len - n - 1; s >= 0; --s) {
-+            if (std::memcmp(ctx.data() + s, pat, (std::size_t)n * sizeof(int)) != 0)
-+                continue;
-+            const long long from = s + n;
-+            int d = 0;
-+            for (long long t = from; t < len && d < max_draft; ++t, ++d)
-+                out->push_back(ctx[(std::size_t)t]);
-+            if (d > 0) return d;
-+        }
-+    }
-+    return 0;
-+}
-+
-+// Longest accepted prefix of a K-token verify pass, plus the bonus token.
-+//
-+// row_argmax(i) must return the argmax of verify-pass logits row i — the token that
-+// truly follows batch position i. Draft i is accepted exactly when it equals that.
-+// Called lazily and never past the first mismatch: each call scans a full 163840-wide
-+// vocabulary row, and rows after a rejection describe a prefix that did not happen.
-+//
-+// Returns j, the number of accepted drafts, in [0, d]. *bonus receives the token
-+// verified at row j; it came from a fully accepted prefix, so it is emitted whatever was
-+// drafted — it is exactly the token a non-speculative step would have produced. The step
-+// therefore emits j+1 tokens, and the state must be rolled back to index j.
-+template <typename RowArgmax>
-+inline int kimi_k3_spec_accept_prefix(const int* draft, int d, RowArgmax row_argmax,
-+                                      int* bonus) {
-+    int j = 0;
-+    for (;;) {
-+        const int a = row_argmax(j);
-+        if (j < d && draft && a == draft[j]) { ++j; continue; }
-+        if (bonus) *bonus = a;
-+        return j;
-+    }
-+}
-+
-+}  // namespace sparkinfer
 diff --git a/runtime/examples/kimi_k3_spec_draft_check.cpp b/runtime/examples/kimi_k3_spec_draft_check.cpp
 new file mode 100644
+index 0000000..e15b77a
 --- /dev/null
 +++ b/runtime/examples/kimi_k3_spec_draft_check.cpp
 @@ -0,0 +1,573 @@
@@ -1403,3 +1075,482 @@ new file mode 100644
 +                g_pass, g_fail);
 +    return g_fail == 0 ? 0 : 1;
 +}
+diff --git a/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h b/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h
+new file mode 100644
+index 0000000..3ee5c41
+--- /dev/null
++++ b/runtime/include/sparkinfer/models/kimi_k3_ngram_draft.h
+@@ -0,0 +1,91 @@
++#pragma once
++// Prompt-lookup (n-gram self-speculation) drafter — pure host logic, no GPU, no NCCL.
++//
++// At each decode step the caller asks: given everything generated so far, what tokens
++// are likely to come next? This answers by finding where the current tail last occurred
++// earlier in the same sequence and proposing whatever followed it that time. It is the
++// whole drafting strategy for K3 speculative decoding, chosen because the model occupies
++// ~110 GB of each Spark's 121 GB and leaves no room for draft weights, and because a
++// drafter that costs nothing when it declines to draft is nearly free to attempt against
++// a break-even acceptance of ~0.13.
++//
++// Cost is a backward memcmp scan over a few thousand ints — microseconds, off the GPU and
++// off the critical path. Header-only so the decode loop and its test share one definition
++// rather than two that can drift.
++
++#include <cstddef>
++#include <cstring>
++#include <vector>
++
++namespace sparkinfer {
++
++struct K3NgramDraftConfig {
++    // Longest tail matched first. Longer matches are rarer but far likelier to continue
++    // correctly, so the scan is strictly best-first: the first n that hits wins.
++    int n_max = 3;
++    // Shortest tail the drafter will accept a match on. Measured on TP3, 3 workloads,
++    // 64 tokens each, against a two-run baseline: n_min = 1 fires on almost every step
++    // because some single token always recurs, and those matches are mostly junk — it
++    // cost freeform prose 12.5% (a K-wide pass bought ~1 token) while buying only 8% more
++    // on code than n_min = 2 does. n_min = 3 is too shy: it drafts on 16% of steps and
++    // gives back most of the win. 2 is the measured optimum, not a guess.
++    int n_min = 2;
++};
++
++// Propose up to max_draft continuation tokens for ctx, appending them to *out.
++// Returns the number proposed; 0 means "no match, take the ordinary single-token path".
++//
++// ctx must be the FULL token history the model has consumed plus the one token the
++// caller is about to feed — the drafter predicts what follows that token, so leaving it
++// out shifts every proposal one position early.
++inline int kimi_k3_ngram_draft(const std::vector<int>& ctx, int max_draft,
++                               const K3NgramDraftConfig& cfg, std::vector<int>* out) {
++    if (!out || max_draft <= 0 || ctx.empty()) return 0;
++    const long long len = (long long)ctx.size();
++    const int n_hi = cfg.n_max < (int)len ? cfg.n_max : (int)len;
++    const int n_lo = cfg.n_min < 1 ? 1 : cfg.n_min;
++
++    for (int n = n_hi; n >= n_lo; --n) {
++        const int* pat = ctx.data() + (len - n);
++        // Backward from the latest possible start, so the FIRST hit is the most recent
++        // occurrence. Recency matters: in structured output the nearest repetition is the
++        // one still in the model's active pattern, and an older one is likely a different
++        // block that merely shares a prefix. Start at len-n-1 so the tail cannot match
++        // itself and so at least one token follows the match.
++        for (long long s = len - n - 1; s >= 0; --s) {
++            if (std::memcmp(ctx.data() + s, pat, (std::size_t)n * sizeof(int)) != 0)
++                continue;
++            const long long from = s + n;
++            int d = 0;
++            for (long long t = from; t < len && d < max_draft; ++t, ++d)
++                out->push_back(ctx[(std::size_t)t]);
++            if (d > 0) return d;
++        }
++    }
++    return 0;
++}
++
++// Longest accepted prefix of a K-token verify pass, plus the bonus token.
++//
++// row_argmax(i) must return the argmax of verify-pass logits row i — the token that
++// truly follows batch position i. Draft i is accepted exactly when it equals that.
++// Called lazily and never past the first mismatch: each call scans a full 163840-wide
++// vocabulary row, and rows after a rejection describe a prefix that did not happen.
++//
++// Returns j, the number of accepted drafts, in [0, d]. *bonus receives the token
++// verified at row j; it came from a fully accepted prefix, so it is emitted whatever was
++// drafted — it is exactly the token a non-speculative step would have produced. The step
++// therefore emits j+1 tokens, and the state must be rolled back to index j.
++template <typename RowArgmax>
++inline int kimi_k3_spec_accept_prefix(const int* draft, int d, RowArgmax row_argmax,
++                                      int* bonus) {
++    int j = 0;
++    for (;;) {
++        const int a = row_argmax(j);
++        if (j < d && draft && a == draft[j]) { ++j; continue; }
++        if (bonus) *bonus = a;
++        return j;
++    }
++}
++
++}  // namespace sparkinfer
+diff --git a/runtime/include/sparkinfer/tp/rank_protocol.h b/runtime/include/sparkinfer/tp/rank_protocol.h
+index 7844136..ea1c8ca 100644
+--- a/runtime/include/sparkinfer/tp/rank_protocol.h
++++ b/runtime/include/sparkinfer/tp/rank_protocol.h
+@@ -19,11 +19,21 @@ namespace sparkinfer {
+ namespace tp {
+ namespace dist {
+ 
+-constexpr std::uint16_t kProtocolVersion = 1;
++// v2 widened the Token frame to carry a whole speculative verify batch plus the
++// rollback index for the PREVIOUS batch. The version is bumped rather than the frame
++// extended compatibly on purpose: a rank still running a v1 binary must reject the
++// frame loudly at decode instead of parsing the first token id and silently running a
++// 1-token step while its peers run a K-token one. Deploying a stale worker is a
++// failure mode this tree has already been bitten by once.
++constexpr std::uint16_t kProtocolVersion = 2;
+ constexpr int kK3Tp3WorldSize = 3;
+ constexpr int kK3Tp4WorldSize = 4;
+ constexpr int kNcclUniqueIdBytes = 128;
+ 
++// Ceiling on one step's token count (1 verified + up to kMaxStepTokens-1 drafted).
++// Bounds the wire frame so a malformed count cannot drive an unbounded allocation.
++constexpr int kMaxStepTokens = 16;
++
+ // Supported multi-Spark world sizes for the Neuron release geometry.
+ inline bool supported_k3_dist_world_size(int world_size) {
+     return world_size == kK3Tp3WorldSize || world_size == kK3Tp4WorldSize;
+@@ -31,8 +41,10 @@ inline bool supported_k3_dist_world_size(int world_size) {
+ constexpr std::size_t kDigestBytes = 32;
+ constexpr std::size_t kMaxDetailBytes = 256;
+ constexpr std::size_t kWireHeaderBytes = 16;
+-constexpr std::size_t kWireFixedPayloadBytes = 250;
+-constexpr std::size_t kMaxPayloadBytes = kWireFixedPayloadBytes + kMaxDetailBytes;
++// 250 in v1; +4 for rollback_j and +4 for the n_token_ids/reserved2 u16 pair.
++constexpr std::size_t kWireFixedPayloadBytes = 258;
++constexpr std::size_t kMaxPayloadBytes =
++    kWireFixedPayloadBytes + kMaxDetailBytes + (std::size_t)kMaxStepTokens * 4;
+ constexpr std::size_t kMaxFrameBytes = kWireHeaderBytes + kMaxPayloadBytes;
+ 
+ using Digest = std::array<std::uint8_t, kDigestBytes>;
+@@ -96,11 +108,22 @@ struct Message {
+     int vocab = 0;
+     int token_id = -1;
+     int status = 0;
++    // Roll the recurrent state back to "having consumed exactly rollback_j+1 tokens of
++    // the PREVIOUS step's batch", applied before this step's own tokens. -1 = nothing to
++    // roll back. Carried on the next Token rather than sent as its own message so a
++    // speculative step still costs exactly one control round trip and the "no later
++    // sequence before StepDone" gate stays exactly as strict as it was.
++    int rollback_j = -1;
+     Phase phase = Phase::None;
+     Digest model_digest{};
+     Digest plan_digest{};
+     NcclUniqueId nccl_id{};
+     std::string detail;
++    // Token frames only. Empty = ordinary single-token step described by token_id.
++    // Non-empty = the K tokens of a speculative verify batch, in recurrence order, with
++    // token_ids[0] == token_id so a reader that only understands the scalar still sees a
++    // consistent leading token.
++    std::vector<int> token_ids;
+ };
+ 
+ // Out-of-band identity supplied by the transport after it has authenticated or
+@@ -161,6 +184,14 @@ public:
+     bool begin_step(int token_id, std::vector<Message>* outbound,
+                     std::string* error = nullptr);
+ 
++    // Broadcast a whole speculative verify batch as ONE step: n_tok tokens in recurrence
++    // order, preceded on each rank by a rollback to prev_rollback_j of the previous
++    // batch (-1 = none). Still one Token message per rank per sequence, so the sequence
++    // gate is untouched. The KV-reset sentinel is not admissible inside a batch — it is
++    // a whole-step operation and must go through begin_step.
++    bool begin_step_multi(const int* token_ids, int n_tok, int prev_rollback_j,
++                          std::vector<Message>* outbound, std::string* error = nullptr);
++
+     // Clean EOS. Finish is sequence-gated and acknowledged by every rank; Finished
+     // is distinct from Failed so a normal generator shutdown is never reported as
+     // an abort.
+@@ -217,8 +248,16 @@ public:
+ 
+     // Accept NcclUniqueId, BeginLoad, Token, Finish, or Abort. For Token, token_id
+     // receives the synchronized input. No later sequence is accepted before StepDone.
++    //
++    // token_ids and rollback_j receive the speculative batch and the pending rollback
++    // index when the coordinator sent one. A caller that passes neither still works and
++    // sees the leading token — but a Token carrying MORE THAN ONE id is REJECTED when
++    // token_ids is null, because running only the first token of a batch the other ranks
++    // are running whole would desynchronize the collectives.
+     bool accept_control(const Message& message, int* token_id = nullptr,
+-                        std::string* error = nullptr);
++                        std::string* error = nullptr,
++                        std::vector<int>* token_ids = nullptr,
++                        int* rollback_j = nullptr);
+ 
+     bool report_nccl_ready(bool success, int status, const std::string& detail,
+                            Message* outbound, std::string* error = nullptr);
+diff --git a/runtime/include/sparkinfer/tp/rank_transport.h b/runtime/include/sparkinfer/tp/rank_transport.h
+index 1e712d8..61e9f04 100644
+--- a/runtime/include/sparkinfer/tp/rank_transport.h
++++ b/runtime/include/sparkinfer/tp/rank_transport.h
+@@ -138,6 +138,10 @@ public:
+     CoordinatorState state() const;
+ 
+     bool begin_step(int token_id, std::string* error = nullptr);
++    // One speculative verify batch as a single step, preceded on every rank by a
++    // rollback to prev_rollback_j of the previous batch (-1 = none).
++    bool begin_step_multi(const int* token_ids, int n_tok, int prev_rollback_j,
++                          std::string* error = nullptr);
+     bool finish(std::string* error = nullptr);
+     bool fail(const std::string& detail, std::string* error = nullptr);
+ 
+@@ -187,7 +191,13 @@ public:
+     // Block until next Token, Finish, or Abort. Returns false on failure/finish.
+     // When true, *token_id is the synchronized input and the caller must run the
+     // local forward then call report_step_done.
+-    bool wait_token(int* token_id, std::string* error = nullptr);
++    //
++    // token_ids receives the whole speculative batch when one was sent (empty otherwise),
++    // and rollback_j the index to roll the PREVIOUS batch back to before running this
++    // step (-1 = none). A caller that passes neither cannot be sent a batch: the session
++    // rejects a multi-token Token with no sink rather than silently running token 0.
++    bool wait_token(int* token_id, std::string* error = nullptr,
++                    std::vector<int>* token_ids = nullptr, int* rollback_j = nullptr);
+     bool report_step_done(bool success, int status, const std::string& detail,
+                           std::string* error = nullptr);
+     bool wait_finished(std::string* error = nullptr);
+diff --git a/runtime/src/tp/rank_protocol.cpp b/runtime/src/tp/rank_protocol.cpp
+index 1ff2d58..3986d4b 100644
+--- a/runtime/src/tp/rank_protocol.cpp
++++ b/runtime/src/tp/rank_protocol.cpp
+@@ -199,6 +199,14 @@ bool encode_message(const Message& m, std::vector<std::uint8_t>* frame,
+         set_error(error, "diagnostic detail exceeds protocol bound");
+         return false;
+     }
++    if (m.token_ids.size() > (std::size_t)kMaxStepTokens) {
++        set_error(error, "step token count exceeds protocol bound");
++        return false;
++    }
++    if (!m.token_ids.empty() && m.token_ids[0] != m.token_id) {
++        set_error(error, "token_ids[0] disagrees with token_id");
++        return false;
++    }
+ 
+     std::vector<std::uint8_t> payload;
+     payload.reserve(kWireFixedPayloadBytes + m.detail.size());
+@@ -213,13 +221,17 @@ bool encode_message(const Message& m, std::vector<std::uint8_t>* frame,
+     put_i32(payload, m.vocab);
+     put_i32(payload, m.token_id);
+     put_i32(payload, m.status);
++    put_i32(payload, m.rollback_j);
+     put_u16(payload, phase);
+     put_u16(payload, 0);  // reserved; must decode as zero
++    put_u16(payload, static_cast<std::uint16_t>(m.token_ids.size()));
++    put_u16(payload, 0);  // reserved2; must decode as zero
+     payload.insert(payload.end(), m.model_digest.begin(), m.model_digest.end());
+     payload.insert(payload.end(), m.plan_digest.begin(), m.plan_digest.end());
+     payload.insert(payload.end(), m.nccl_id.begin(), m.nccl_id.end());
+     put_u16(payload, static_cast<std::uint16_t>(m.detail.size()));
+     payload.insert(payload.end(), m.detail.begin(), m.detail.end());
++    for (int id : m.token_ids) put_i32(payload, id);
+ 
+     frame->clear();
+     if (payload.size() < kWireFixedPayloadBytes || payload.size() > kMaxPayloadBytes) {
+@@ -264,13 +276,13 @@ bool decode_message(const std::uint8_t* frame, std::size_t size, Message* messag
+     Reader r{payload, payload_size, 0};
+     Message m;
+     m.type = static_cast<MessageType>(type);
+-    std::uint16_t phase = 0, reserved = 0, detail_size = 0;
++    std::uint16_t phase = 0, reserved = 0, n_ids = 0, reserved2 = 0, detail_size = 0;
+     if (!r.u64(&m.session_id) || !r.u64(&m.sequence) ||
+         !r.i32(&m.rank) || !r.i32(&m.world_size) || !r.i32(&m.local_device) ||
+         !r.i32(&m.n_experts) || !r.i32(&m.moe_ffn) ||
+         !r.i32(&m.expert_block_elems) || !r.i32(&m.vocab) ||
+-        !r.i32(&m.token_id) || !r.i32(&m.status) ||
+-        !r.u16(&phase) || !r.u16(&reserved) ||
++        !r.i32(&m.token_id) || !r.i32(&m.status) || !r.i32(&m.rollback_j) ||
++        !r.u16(&phase) || !r.u16(&reserved) || !r.u16(&n_ids) || !r.u16(&reserved2) ||
+         !r.bytes(m.model_digest.data(), m.model_digest.size()) ||
+         !r.bytes(m.plan_digest.data(), m.plan_digest.size()) ||
+         !r.bytes(m.nccl_id.data(), m.nccl_id.size()) ||
+@@ -278,13 +290,29 @@ bool decode_message(const std::uint8_t* frame, std::size_t size, Message* messag
+         set_error(error, "truncated message payload"); return false;
+     }
+     if (!valid_phase(phase)) { set_error(error, "unknown protocol phase"); return false; }
+-    if (reserved != 0) { set_error(error, "nonzero reserved field"); return false; }
+-    if (detail_size > kMaxDetailBytes || r.at + detail_size != r.size) {
++    if (reserved != 0 || reserved2 != 0) {
++        set_error(error, "nonzero reserved field"); return false;
++    }
++    if (n_ids > kMaxStepTokens) {
++        set_error(error, "step token count outside protocol bounds"); return false;
++    }
++    if (detail_size > kMaxDetailBytes || r.at + detail_size > r.size) {
+         set_error(error, "invalid diagnostic detail length"); return false;
+     }
+     m.phase = static_cast<Phase>(phase);
+     m.detail.assign(reinterpret_cast<const char*>(r.data + r.at), detail_size);
+     r.at += detail_size;
++    m.token_ids.resize(n_ids);
++    for (std::uint16_t i = 0; i < n_ids; ++i) {
++        if (!r.i32(&m.token_ids[i])) {
++            set_error(error, "truncated step token vector"); return false;
++        }
++    }
++    // Exact length, as in v1: a frame with trailing bytes is malformed, not tolerated.
++    if (r.at != r.size) { set_error(error, "trailing bytes after payload"); return false; }
++    if (n_ids > 0 && m.token_ids[0] != m.token_id) {
++        set_error(error, "token_ids[0] disagrees with token_id"); return false;
++    }
+     *message = std::move(m);
+     return true;
+ }
+@@ -521,6 +549,43 @@ bool Coordinator::begin_step(int token_id, std::vector<Message>* outbound,
+     return true;
+ }
+ 
++bool Coordinator::begin_step_multi(const int* token_ids, int n_tok, int prev_rollback_j,
++                                   std::vector<Message>* outbound, std::string* error) {
++    if (state_ != CoordinatorState::Ready) {
++        if (state_ == CoordinatorState::Failed) { set_error(error, failure_); return false; }
++        if (state_ == CoordinatorState::Finished) {
++            set_error(error, "cluster already finished");
++            return false;
++        }
++        return abort_cluster(Phase::Step, -14, "batch started before cluster Ready",
++                             outbound, error);
++    }
++    if (!outbound) return abort_cluster(Phase::Step, -15,
++                                        "batch broadcast has no outbound sink", outbound, error);
++    if (!token_ids || n_tok < 1 || n_tok > kMaxStepTokens)
++        return abort_cluster(Phase::Step, -23, "batch token count outside protocol bounds",
++                             outbound, error);
++    // No -2 sentinel here: a KV reset is a whole-step operation, not a batch member.
++    for (int b = 0; b < n_tok; ++b)
++        if (token_ids[b] < 0 || token_ids[b] >= cluster_.vocab)
++            return abort_cluster(Phase::Step, -16, "batch token id outside vocabulary",
++                                 outbound, error);
++    if (prev_rollback_j < -1 || prev_rollback_j >= kMaxStepTokens)
++        return abort_cluster(Phase::Step, -24, "rollback index outside protocol bounds",
++                             outbound, error);
++    std::fill(step_done_.begin(), step_done_.end(), 0);
++    for (int rank = 0; rank < cluster_.world_size; ++rank) {
++        Message m = control(MessageType::Token, rank);
++        m.phase = Phase::Step;
++        m.token_id = token_ids[0];
++        m.rollback_j = prev_rollback_j;
++        m.token_ids.assign(token_ids, token_ids + n_tok);
++        outbound->push_back(std::move(m));
++    }
++    state_ = CoordinatorState::StepInFlight;
++    return true;
++}
++
+ bool Coordinator::finish(std::vector<Message>* outbound, std::string* error) {
+     if (state_ != CoordinatorState::Ready) {
+         if (state_ == CoordinatorState::Failed) { set_error(error, failure_); return false; }
+@@ -585,7 +650,8 @@ bool RankSession::hello(Message* outbound, std::string* error) {
+     return true;
+ }
+ 
+-bool RankSession::accept_control(const Message& m, int* token_id, std::string* error) {
++bool RankSession::accept_control(const Message& m, int* token_id, std::string* error,
++                                 std::vector<int>* token_ids, int* rollback_j) {
+     if (m.session_id != spec_.session_id || m.world_size != spec_.world_size ||
+         m.rank != spec_.rank || m.local_device != spec_.local_device ||
+         m.n_experts != spec_.n_experts || m.moe_ffn != spec_.moe_ffn ||
+@@ -641,7 +707,23 @@ bool RankSession::accept_control(const Message& m, int* token_id, std::string* e
+             if (!(m.token_id == -2) && (m.token_id < 0 || m.token_id >= spec_.vocab))
+                 return reject("Token id outside vocabulary", error);
+             if (!token_id) return reject("Token has no output sink", error);
++            if (m.token_ids.size() > (std::size_t)kMaxStepTokens)
++                return reject("Token batch exceeds protocol bound", error);
++            // Running only the leading token of a batch every other rank runs whole would
++            // leave this rank issuing a different number of collectives, which hangs NCCL
++            // rather than failing — refuse it here where the diagnostic is readable.
++            if (m.token_ids.size() > 1 && !token_ids)
++                return reject("Token batch has no batch output sink", error);
++            for (std::size_t b = 0; b < m.token_ids.size(); ++b)
++                if (m.token_ids[b] < 0 || m.token_ids[b] >= spec_.vocab)
++                    return reject("Token batch id outside vocabulary", error);
++            if (m.rollback_j < -1 || m.rollback_j >= kMaxStepTokens)
++                return reject("Token rollback index outside protocol bounds", error);
++            if (m.rollback_j >= 0 && !rollback_j)
++                return reject("Token rollback has no output sink", error);
+             *token_id = m.token_id;
++            if (token_ids) *token_ids = m.token_ids;
++            if (rollback_j) *rollback_j = m.rollback_j;
+             state_ = RankState::StepRunning;
+             return true;
+ 
+diff --git a/runtime/src/tp/rank_transport_tcp.cpp b/runtime/src/tp/rank_transport_tcp.cpp
+index 59f2e15..2e449a4 100644
+--- a/runtime/src/tp/rank_transport_tcp.cpp
++++ b/runtime/src/tp/rank_transport_tcp.cpp
+@@ -714,6 +714,15 @@ bool CoordinatorTransport::begin_step(int token_id, std::string* error) {
+     return dispatch_outbound(outbound, error);
+ }
+ 
++bool CoordinatorTransport::begin_step_multi(const int* token_ids, int n_tok,
++                                            int prev_rollback_j, std::string* error) {
++    std::lock_guard<std::mutex> lock(mu_);
++    std::vector<Message> outbound;
++    if (!coord_.begin_step_multi(token_ids, n_tok, prev_rollback_j, &outbound, error))
++        return false;
++    return dispatch_outbound(outbound, error);
++}
++
+ bool CoordinatorTransport::finish(std::string* error) {
+     // Do NOT hold mu_ across the wait — rx_loop needs mu_ to accept worker FinishAcks.
+     {
+@@ -924,11 +933,14 @@ bool RankTransport::bootstrap(
+     return session_.state() == RankState::WaitingToken;
+ }
+ 
+-bool RankTransport::wait_token(int* token_id, std::string* error) {
++bool RankTransport::wait_token(int* token_id, std::string* error,
++                               std::vector<int>* token_ids, int* rollback_j) {
+     Message m;
++    if (token_ids) token_ids->clear();
++    if (rollback_j) *rollback_j = -1;
+     if (!recv(&m, error)) return false;
+     int tok = -1;
+-    if (!session_.accept_control(m, &tok, error)) return false;
++    if (!session_.accept_control(m, &tok, error, token_ids, rollback_j)) return false;
+     if (m.type == MessageType::Finish || m.type == MessageType::Abort) {
+         return false;
+     }
+diff --git a/runtime/tests/tp3_rank_protocol_cpu_test.cpp b/runtime/tests/tp3_rank_protocol_cpu_test.cpp
+index cbc1a20..bb3e882 100644
+--- a/runtime/tests/tp3_rank_protocol_cpu_test.cpp
++++ b/runtime/tests/tp3_rank_protocol_cpu_test.cpp
+@@ -56,7 +56,8 @@ static bool same_message(const Message& a, const Message& b) {
+            a.expert_block_elems == b.expert_block_elems && a.vocab == b.vocab &&
+            a.token_id == b.token_id && a.status == b.status && a.phase == b.phase &&
+            a.model_digest == b.model_digest && a.plan_digest == b.plan_digest &&
+-           a.nccl_id == b.nccl_id && a.detail == b.detail;
++           a.nccl_id == b.nccl_id && a.detail == b.detail &&
++           a.rollback_j == b.rollback_j && a.token_ids == b.token_ids;
+ }
+ 
+ static Message wire(const Message& in) {
+@@ -187,10 +188,17 @@ static void test_wire_contract_and_corruption() {
+               error.find("magic") != std::string::npos,
+           "bad magic must fail");
+     corrupt = bytes;
+-    corrupt[4] = 2; corrupt[5] = 0;
++    // Any version other than the current one, including the PREVIOUS one: a rank running
++    // a v1 binary must reject a v2 Token rather than parse its scalar token_id and run a
++    // 1-token step while its peers run the whole batch.
++    corrupt[4] = 1; corrupt[5] = 0;
+     CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
+               error.find("version") != std::string::npos,
+-          "bad version must fail");
++          "superseded version must fail");
++    corrupt[4] = (std::uint8_t)(kProtocolVersion + 1); corrupt[5] = 0;
++    CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
++              error.find("version") != std::string::npos,
++          "future version must fail");
+     corrupt = bytes;
+     corrupt[6] = 99; corrupt[7] = 0;
+     CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
+@@ -211,7 +219,17 @@ static void test_wire_contract_and_corruption() {
+           "oversized detail must fail");
+     hello.detail.assign(kMaxDetailBytes, 'x');
+     CHECK(encode_message(hello, &bytes, &error), "maximum-size frame must encode");
++    // v2 added a variable token-id tail, so the largest frame a transport must be sized
++    // for is max detail AND a full speculative batch, not max detail alone.
++    CHECK_EQ(bytes.size(), kWireHeaderBytes + kWireFixedPayloadBytes + kMaxDetailBytes);
++    hello.token_id = 5;
++    hello.token_ids.assign(kMaxStepTokens, 5);
++    CHECK(encode_message(hello, &bytes, &error), "maximum batch frame must encode");
+     CHECK_EQ(bytes.size(), kMaxFrameBytes);
++    CHECK(same_message(hello, wire(hello)), "maximum batch frame must round-trip");
++    hello.token_ids.assign(kMaxStepTokens + 1, 5);
++    CHECK(!encode_message(hello, &bytes, &error) && error.find("bound") != std::string::npos,
++          "oversized batch must fail: %s", error.c_str());
+ }
+ 
+ static void test_full_bootstrap_load_and_two_steps() {
+-- 
+2.52.0.windows.1
+
