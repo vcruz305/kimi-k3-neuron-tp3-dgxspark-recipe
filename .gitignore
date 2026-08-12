@@ -2,6 +2,17 @@
 *.gguf
 .env
 .secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.log
+*.pid
+run/
+dist/
+build/
+api-server/venv/
 __pycache__/
 *.pyc
 .venv/

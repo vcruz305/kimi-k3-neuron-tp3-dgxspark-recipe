@@ -14,7 +14,7 @@ import sys
 
 from transformers import AutoTokenizer
 
-TOKENIZER_DIR = os.environ.get("K3_TOKENIZER_DIR", "/home/victor/models/k3-tokenizer")
+TOKENIZER_DIR = os.environ.get("K3_TOKENIZER_DIR", os.path.expanduser("~/models/k3-tokenizer"))
 ID_RE = re.compile(r"prompt=(\d+) generated_ids=([\d,]+)")
 
 
