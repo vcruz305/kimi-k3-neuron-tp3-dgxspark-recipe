@@ -151,7 +151,7 @@ Once rank0 logs `serve mode listening on 127.0.0.1:29600`, start the wrapper
 
 ```bash
 export K3_TOKENIZER_DIR=$HOME/models/k3-tokenizer
-export K3_CHAT_TEMPLATE=$HOME/models/kimi-k3-neuron-iq1s-local/k3_chat_template.jinja
+export K3_CHAT_TEMPLATE=$HOME/models/Kimi-K3-UD-IQ1_S/k3_chat_template.jinja
 export K3_SERVE_HOST=127.0.0.1
 export K3_SERVE_PORT=29600
 api-server/venv/bin/python api-server/server.py --host 0.0.0.0 --port 8000

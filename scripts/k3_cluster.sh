@@ -14,7 +14,7 @@ usage: k3_cluster.sh {sync|start|stop|status|dry-run}
 Run on the coordinator machine. Required settings:
   K3_HOME=$HOME/k3-neuron
   COORDINATOR_FABRIC=10.10.10.2       # reachable private/fabric IPv4 address
-  MODEL=$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf
+  MODEL=$K3_HOME/model/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf
 
 Remote cluster (default MODE=remote):
   TP_SIZE=3 PEER_A=user@10.10.10.4 PEER_B=user@10.10.10.6
@@ -40,7 +40,7 @@ case "$ACTION" in sync|start|stop|status|dry-run|__worker|__stop|__status) ;; *)
 K3_HOME=${K3_HOME:-"$HOME/k3-neuron"}
 DIST=${DIST:-"$K3_HOME/dist"}
 BIN=${BIN:-"$DIST/kimi_k3_dist_generate"}
-MODEL=${MODEL:-"$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf"}
+MODEL=${MODEL:-"$K3_HOME/model/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf"}
 MODE=${MODE:-remote}
 TP_SIZE=${TP_SIZE:-3}
 COORDINATOR_FABRIC=${COORDINATOR_FABRIC:-}

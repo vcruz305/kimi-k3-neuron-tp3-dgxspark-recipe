@@ -250,7 +250,7 @@ against the working tree.
 ```bash
 # rank0 — prefer longer decode for stable tok/s
 ./kimi_k3_dist_generate --rank 0 --world 3 --listen 0.0.0.0:29500 \
-  --model .../k3-neuron-iq1s-00001-of-00009.gguf \
+  --model .../Kimi-K3-UD-IQ1_S-00001-of-00009.gguf \
   --prompt-ids 1,2,3 --n-predict 32 --max-ctx 8192 2> r0.stderr | tee r0.stdout
 
 # ranks 1/2

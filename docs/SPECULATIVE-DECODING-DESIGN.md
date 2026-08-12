@@ -78,7 +78,7 @@ That said, SparkInfer already has `DFlashDraftModel` (`dflash_draft.cpp`) with a
 
 ## 4. Re-derived byte accounting (corrected engine)
 
-All figures parsed directly from the GGUF tensor headers on rank0 (`/home/victor/models/kimi-k3-neuron-iq1s-local/`, 9 shards, 2573 tensors, **330,160,710,016 B = 330.161 GB**). Quantisation: IQ1_S = 50 B / 256 weights; Q8_0 = 34 B / 32 weights.
+All figures parsed directly from the GGUF tensor headers on rank0 (`/home/victor/models/Kimi-K3-UD-IQ1_S/`, 9 shards, 2573 tensors, **330,160,710,016 B = 330.161 GB**). Quantisation: IQ1_S = 50 B / 256 weights; Q8_0 = 34 B / 32 weights.
 
 Confirmed GGUF metadata: `expert_count 896`, `expert_used_count 16`, `expert_shared_count 4`, `expert_feed_forward_length 1536`, `block_count 93`, `leading_dense_block_count 1`, `head_count_kv` = period-4 array `[0,0,0,1,...]` ⇒ **69 KDA / 24 MLA layers**.
 

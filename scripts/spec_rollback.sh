@@ -5,7 +5,7 @@
 # bootstrap ("accept timeout" / "connect: Connection refused").
 set -u
 ROOT=/home/victor/work/k3-tp3-0012; DIST=$ROOT/dist; RUN=$ROOT/run
-MODEL=/home/victor/models/kimi-k3-neuron-iq1s-local/k3-neuron-iq1s-00001-of-00009.gguf
+MODEL=/home/victor/models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf
 R1=10.10.10.4; R2=10.10.10.6
 SSHQ="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no"
 K=${K:-8}

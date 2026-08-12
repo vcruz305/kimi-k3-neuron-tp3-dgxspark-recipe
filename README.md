@@ -40,13 +40,13 @@ export HF_XET_HIGH_PERFORMANCE=1
 export K3_HOME=$HOME/k3-neuron
 mkdir -p "$K3_HOME/model" "$K3_HOME/tokenizer"
 
-hf download vcruz305/Kimi-K3-Neuron-IQ1S-GGUF --local-dir "$K3_HOME/model" \
+hf download vcruz305/Kimi-K3-GGUF --local-dir "$K3_HOME/model" \
   --include "*.gguf" --include "k3_chat_template.jinja"
 hf download moonshotai/Kimi-K3 --local-dir "$K3_HOME/tokenizer" \
   --include "config.json" --include "generation_config.json" \
   --include "tokenization_kimi.py" --include "tiktoken.model" --include "tokenizer_config.json"
 
-test -f "$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf"
+test -f "$K3_HOME/model/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf"
 test -f "$K3_HOME/tokenizer/tokenization_kimi.py"
 ```
 
@@ -91,7 +91,7 @@ export K3_HOME=$HOME/k3-neuron
 export COORDINATOR_FABRIC=10.10.10.2
 export PEER_A=youruser@10.10.10.4
 export PEER_B=youruser@10.10.10.6
-export MODEL="$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf"
+export MODEL="$K3_HOME/model/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf"
 cd "$K3_HOME/src/recipe"
 
 # Safe preview first: no SSH, file copy, or process changes.
@@ -128,7 +128,7 @@ export COORDINATOR_FABRIC=10.10.10.2
 export PEER_A=youruser@10.10.10.4
 export PEER_B=youruser@10.10.10.6
 export PEER_C=youruser@10.10.10.8
-export MODEL="$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf"
+export MODEL="$K3_HOME/model/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf"
 cd "$K3_HOME/src/recipe"
 bash scripts/k3_cluster.sh dry-run
 bash scripts/k3_cluster.sh start
@@ -148,7 +148,7 @@ export K3_HOME=$HOME/k3-neuron
 export MODE=local TP_SIZE=4
 export COORDINATOR_FABRIC=127.0.0.1
 export GPU_COORDINATOR=0 GPU_COMPUTE_A=1 GPU_COMPUTE_B=2 GPU_COMPUTE_C=3
-export MODEL="$K3_HOME/model/k3-neuron-iq1s-00001-of-00009.gguf"
+export MODEL="$K3_HOME/model/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf"
 cd "$K3_HOME/src/recipe"
 bash scripts/k3_cluster.sh dry-run
 bash scripts/k3_cluster.sh start

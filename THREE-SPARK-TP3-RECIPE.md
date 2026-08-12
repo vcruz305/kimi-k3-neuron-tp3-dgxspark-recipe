@@ -82,7 +82,7 @@ supported switch exists — ~84 GiB/rank, more headroom. Same missing forward st
 pip install -U "huggingface_hub[hf_xet]"
 hf auth login
 export HF_XET_HIGH_PERFORMANCE=1
-hf download vcruz305/Kimi-K3-Neuron-IQ1S-GGUF --local-dir ./k3-neuron-iq1s \
+hf download vcruz305/Kimi-K3-GGUF --local-dir ./Kimi-K3-UD-IQ1_S \
   --include "*.gguf" --include "k3_chat_template.jinja"
 ```
 

@@ -15,17 +15,17 @@ your private Spark network addresses.
 
 ```bash
 # Spark 0 (rank 0): also hosts the API wrapper.
-RANK=0 MODEL=/models/k3/k3-neuron-iq1s-00001-of-00009.gguf \
+RANK=0 MODEL=/models/k3/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf \
 DIST=/opt/k3-tp3/dist LISTEN=10.10.10.2:29500 SERVE=127.0.0.1:29600 \
 bash scripts/launch_tp3_rank.sh
 
 # Spark 1, in a second terminal/host.
-RANK=1 MODEL=/models/k3/k3-neuron-iq1s-00001-of-00009.gguf \
+RANK=1 MODEL=/models/k3/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf \
 DIST=/opt/k3-tp3/dist COORD=10.10.10.2:29500 \
 bash scripts/launch_tp3_rank.sh
 
 # Spark 2, in a third terminal/host.
-RANK=2 MODEL=/models/k3/k3-neuron-iq1s-00001-of-00009.gguf \
+RANK=2 MODEL=/models/k3/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf \
 DIST=/opt/k3-tp3/dist COORD=10.10.10.2:29500 \
 bash scripts/launch_tp3_rank.sh
 ```

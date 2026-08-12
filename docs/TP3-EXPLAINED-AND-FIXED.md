@@ -98,7 +98,7 @@ export NCCL_NVLS_ENABLE=0
 export LD_LIBRARY_PATH=.../nvidia/nccl/lib:build-sm90-tp3width/runtime:$LD_LIBRARY_PATH
 
 ./build-sm90-tp3width/runtime/kimi_k3_tp_generate \
-  /root/k3/model/k3-neuron-iq1s-00001-of-00009.gguf \
+  /root/k3/model/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf \
   --ids @prompt.ids --devices 0,1,2 --max-new 8 --ctx 2048 \
   --logits out.spkl
 ```

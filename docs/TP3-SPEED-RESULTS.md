@@ -3,7 +3,7 @@
 **Date:** 2026-08-09  
 **Fleet:** spark-78f1 (r0), 9f73 (r1), 366f (r2) · coord `10.10.10.2:29500`  
 **Geometry:** `AllExpertsFfnWidth` · FFN 512/512/512 · ~113 GiB/rank · `moe_ffn_local=512`  
-**Model:** local NVMe `kimi-k3-neuron-iq1s-local` · max_ctx=8192 · WEPS=0 · GRAPH=0  
+**Model:** local NVMe `Kimi-K3-UD-IQ1_S` · max_ctx=8192 · WEPS=0 · GRAPH=0  
 
 ---
 

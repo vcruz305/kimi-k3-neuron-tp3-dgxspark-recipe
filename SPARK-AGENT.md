@@ -46,7 +46,7 @@ Read **this entire file** before changing fleet state. Prefer evidence over assu
 | Process model | **1 process / Spark**, `local_device=0`, global rank `0..world-1` |
 | TP3 MoE geometry | All **896** experts; FFN bands **[0,512), [512,1024), [1024,1536)** |
 | Memory plan | **~112.85 GiB/rank** — tight on 128 GB Sparks |
-| Model | HF `vcruz305/Kimi-K3-Neuron-IQ1S-GGUF` (~330 GB, 9 shards, gated) |
+| Model | HF `vcruz305/Kimi-K3-GGUF` (~330 GB, 9 shards, gated) |
 | SparkInfer base | `7a9b77a043596157d74e4af376cf9f29f68ce368` |
 | Control plane | TCP framed protocol in patches `next/0002` + `0003` |
 | Collectives | `ncclCommInitRank` + opaque 128-byte id; **not** `ncclCommInitAll` across hosts |

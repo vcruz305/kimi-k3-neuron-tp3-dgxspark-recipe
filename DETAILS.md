@@ -133,16 +133,16 @@ Do **not** hot-add a 4th rank to a running TP3 job — relaunch with `--world 4`
 pip install -U "huggingface_hub[hf_xet]"
 hf auth login
 export HF_XET_HIGH_PERFORMANCE=1
-mkdir -p $HOME/models/kimi-k3-neuron-iq1s-local
-hf download vcruz305/Kimi-K3-Neuron-IQ1S-GGUF \
-  --local-dir $HOME/models/kimi-k3-neuron-iq1s-local \
+mkdir -p $HOME/models/Kimi-K3-UD-IQ1_S
+hf download vcruz305/Kimi-K3-GGUF \
+  --local-dir $HOME/models/Kimi-K3-UD-IQ1_S \
   --include "*.gguf" --include "k3_chat_template.jinja"
 ```
 
 Entry shard:
 
 ```text
-$HOME/models/kimi-k3-neuron-iq1s-local/k3-neuron-iq1s-00001-of-00009.gguf
+$HOME/models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf
 ```
 
 ### 2. Build + apply the verified chain through 0026
@@ -178,7 +178,7 @@ export SPARKINFER_K3_MOE_WEPS=0
 export SPARKINFER_K3_GRAPH=0
 export NCCL_NVLS_ENABLE=0
 export CUDA_VISIBLE_DEVICES=0
-MODEL=$HOME/models/kimi-k3-neuron-iq1s-local/k3-neuron-iq1s-00001-of-00009.gguf
+MODEL=$HOME/models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00009.gguf
 ```
 
 Rank 0:
