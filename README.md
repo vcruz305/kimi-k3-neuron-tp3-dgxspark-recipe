@@ -159,6 +159,29 @@ For a pure SM120 PC, build with `-DCMAKE_CUDA_ARCHITECTURES=120`. Start at
 `MAX_CTX=4096`, close other GPU workloads, and validate peer access/NCCL before a
 long load. Use `bash scripts/k3_cluster.sh stop` to stop all four helper-owned roles.
 
+**Prefill on this layout is experimental and currently slow.** Same-host TP4+NCCL
+falls back to **per-token** prefill when the tile path cannot use owned collective
+buffers (`owns_buffers()==false`). That is a known SparkInfer+NCCL hole, not
+“Blackwell is slow.” Symptom: prefill tok/s ≈ decode tok/s and **falls** as the
+prompt grows (a 4× RTX PRO 6000 Blackwell box measured ~46 tok/s at 256 prompt
+tokens down to ~26 tok/s at 3500). Real tiled/chunked prefill is many times
+decode. V4 Flash ~6000 tok/s TP4 is **not** a K3 Neuron target.
+
+Before a long suite:
+
+1. Grep coordinator logs for `tile path disabled`, `no owned buffers`, or
+   `Using per-token prefill`.
+2. Do **not** copy Lium H200 `NCCL_NVLS_ENABLE=0` onto this PC. A/B
+   `NCCL_NVLS_ENABLE=1` and unset `SPARKINFER_K3_PREFILL` so tile can arm if
+   NVLS/multimem gives owned buffers.
+3. Keep `SPARKINFER_K3_MOE_WEPS=0`. A/B `SPARKINFER_K3_KDA_FUSE=0`.
+4. Report **prefill and decode separately**. Do not quote this box’s prefill as a
+   qualified recipe number, and do not start a full eval suite until prefill
+   tok/s is clearly above decode.
+
+The engine fix (still open) is chunked/tile prefill via `allreduce_f32_group`
+(same collective as per-token), not `allreduce_f32_owned_slot` on plain NCCL.
+
 ## 5. OpenAI-compatible API for Hermes and other agents
 
 Run this only on the coordinator, after `status` reports the coordinator process

@@ -20,6 +20,11 @@ This file prevents invalid comparisons and unsafe launch procedures.
   result as an RTX PRO 6000 Blackwell result.
 - Any TP4 run with the TP3 K=8/P8 flags as evidence that TP4 reaches 12.5492 tok/s.
   TP4 is code-supported and experimental; it has no current public speed claim.
+- Per-token SparkInfer prefill (~26–46 tok/s on a 4× RTX PRO 6000 Blackwell PC,
+  prefill ≈ decode and falling with length) as a Blackwell kernel ceiling or as
+  comparable to V4 Flash ~6000 tok/s TP4. That shape means tile prefill is off
+  (`owns_buffers()==false` / `SPARKINFER_K3_PREFILL=0`). Report pp and tg
+  separately; do not start a multi-hour suite on that path.
 
 ## Do not use these as a public launcher
 

@@ -35,6 +35,13 @@ not a qualified current performance recipe. In particular, K=8/P8's 12.5492 tok/
 claim belongs only to TP3. Re-run all release gates, topology/NCCL checks, and a
 bracket on the target hardware before making a TP4 claim.
 
+**Prefill:** same-host TP4+NCCL still uses **per-token** prefill when tile cannot
+arm (`owns_buffers()==false`; env equivalent `SPARKINFER_K3_PREFILL=0`). A 4×
+RTX PRO 6000 Blackwell PC measured prefill ≈ decode (~46 tok/s at 256 tokens,
+~26 tok/s at 3500). That is the open “fast tile prefill on plain NCCL” item, not
+a qualified Blackwell number. Do not copy `NCCL_NVLS_ENABLE=0` from Lium H200
+onto that PC; A/B NVLS=1 first. Do not compare to V4 Flash ~6000 tok/s TP4.
+
 ## Measured result — scope matters
 
 The latest qualified TP3 structured-generation bracket is **12.55 decode tokens/s**
